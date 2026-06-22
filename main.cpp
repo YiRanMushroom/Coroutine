@@ -41,13 +41,47 @@ task<void> test_or() {
     co_await coroutine::any_of<task>(say_but_slow().into(), say_but_slow().into(), say1());
 }
 
+coroutine::generator<int> count_up_to(int n) {
+    for (int i = 0; i < n; ++i) {
+        co_yield i;
+    }
+}
+
+task<void> say_to_n(int n) {
+    coroutine::generator<int> gen = count_up_to(n);
+
+    std::cout << std::format("Handle {}", (void *) gen.get_promise()) << std::endl;
+
+    std::cout << "Counting up to " << n << ":" << std::endl;
+
+    while (auto result = co_await gen) {
+        auto unwrapped = std::move(result).value();
+        std::cout << std::format("Got value: {0}, handle: {1}\n", unwrapped, (void *) gen.get_promise()) << std::flush;
+    }
+    std::cout << "Done counting!" << std::endl;
+    co_return;
+}
+
+cancelable_task<void> do_many_things(int n) {
+    if (n < 2) {
+        co_return;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    co_await coroutine::any_of(do_many_things(n - 1), do_many_things(n - 2));
+
+    std::cout << n;
+}
+
 int main() {
     {
         auto execution_ctx = coroutine::_details::multithreaded_execution_context{};
 
         // auto t = say3();
 
-        execution_ctx.block_on(test_or());
+        execution_ctx.block_on(do_many_things(17));
     }
+    std::cout << std::endl;
     std::cout << coroutine::_details::debug_get_active_promise_count() << std::endl;
 }
