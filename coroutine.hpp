@@ -1946,7 +1946,7 @@ namespace coroutine {
                 }
             };
 
-            inline timeout_t timeout(std::chrono::milliseconds duration) {
+            inline timeout_t with_timeout(std::chrono::milliseconds duration) {
                 return timeout_t(duration);
             }
 
@@ -1975,11 +1975,14 @@ namespace coroutine {
                 }
             };
 
-            inline timeout_or_throw_t timeout_or_throw(std::chrono::milliseconds duration) {
+            inline timeout_or_throw_t with_timeout_throw(std::chrono::milliseconds duration) {
                 return timeout_or_throw_t(duration);
             }
         }
     }
+
+    using _details::_pipe_utils::with_timeout;
+    using _details::_pipe_utils::with_timeout_throw;
 }
 
 template<coroutine::_details::_pipe_utils::is_future T, coroutine::_details::_pipe_utils::is_coroutine_pipe_operand Op>

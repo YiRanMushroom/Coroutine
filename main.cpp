@@ -86,7 +86,7 @@ task<void> test_many_asm() {
     co_await say1();
     co_await coroutine::all_of(say1(), say1(), say1());
     co_await coroutine::any_of(say1(), say1(), say1());
-    co_await (say1() | coroutine::_details::_pipe_utils::timeout(std::chrono::milliseconds(100)));
+    co_await (say1() | coroutine::with_timeout(std::chrono::milliseconds(100)));
 }
 
 int main() {
