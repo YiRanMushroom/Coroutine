@@ -299,7 +299,7 @@ namespace coroutine {
         std::atomic_size_t g_promise_count{0};
 
         size_t debug_get_active_promise_count() noexcept {
-            return g_promise_count.load(std::memory_order_relaxed);
+            return g_promise_count.load(std::memory_order_acquire);
         }
 
         class promise_base : public pin_resource_base {
@@ -308,7 +308,7 @@ namespace coroutine {
 
         protected:
             ~promise_base() {
-                g_promise_count.fetch_sub(1, std::memory_order_relaxed);
+                g_promise_count.fetch_sub(1, std::memory_order_release);
             }
 
         public:
@@ -579,36 +579,53 @@ namespace coroutine {
                 return promise->get_result_move();
             }
 
-            task_base<T> &by_promise(promise_base *parent_promise) {
+            auto by_promise(promise_base *parent_promise) {
                 assert(parent_promise);
-
 
                 if (!this->m_coroutine_handle) {
                     throw std::runtime_error("No coroutine associated with this task.");
                 }
 
-                execution_context *context = parent_promise->get_execution_context();
-                assert(context);
-                promise_base *promise = this->get_promise();
-                if (!promise->get_execution_context()) {
-                    // Inherit parent's execution context if not set yet
-                    promise->set_execution_context(context);
-                }
+                struct awaiter {
+                    task_base<T> m_task;
+                    promise_base *m_parent_promise;
 
-                auto weak_parent_handle = ref_counted_resource_weak_handle(
-                    parent_promise, resource_acquisition_semantics::copy{});
-
-                assert(!promise->m_continuation); // Ensure no continuation is set yet
-
-                promise->set_continuation([weak_parent_handle = std::move(weak_parent_handle), context]() mutable {
-                    if (auto parent_handle = weak_parent_handle.lock()) {
-                        context->resume_promise(static_cast<promise_base *>(parent_handle.get()));
+                    bool await_ready() const noexcept {
+                        return false;
                     }
-                });
 
-                promise->get_execution_context()->resume_promise(promise);
+                    void await_suspend(std::coroutine_handle<> h) noexcept {
+                        execution_context *context = m_parent_promise->get_execution_context();
+                        assert(context);
 
-                return *this;
+                        auto *promise = m_task.get_promise();
+                        if (!promise->get_execution_context()) {
+                            promise->set_execution_context(context);
+                        }
+
+                        auto weak_parent = ref_counted_resource_weak_handle(
+                            m_parent_promise, resource_acquisition_semantics::copy{});
+
+                        auto *local_ctx = promise->get_execution_context();
+
+                        promise->set_continuation([weak_parent = std::move(weak_parent)]() mutable {
+                            auto parent = weak_parent.lock();
+                            if (!parent) {
+                                return;
+                            }
+                            auto *p = static_cast<promise_base *>(parent.get());
+                            p->get_execution_context()->resume_promise(p);
+                        });
+
+                        local_ctx->resume_promise(promise);
+                    }
+
+                    decltype(auto) await_resume() {
+                        return m_task.get_promise()->get_result_move();
+                    }
+                };
+
+                return awaiter{std::move(*this), parent_promise};
             }
 
             T await_resume() {
@@ -897,7 +914,11 @@ namespace coroutine {
                 m_thread_pool->EnqueueFunc([promise_handle]mutable {
                     auto *promise = static_cast<promise_base *>(promise_handle.get());
                     auto handle = std::coroutine_handle<promise_base>::from_promise(*promise);
-                    handle.resume();
+
+                    if (handle && !handle.done()) {
+                        handle.resume();
+                    }
+
                     promise_handle.reset();
                 });
             }
@@ -1001,21 +1022,11 @@ namespace coroutine {
 
             auto state = std::make_shared<SharedState>();
             state->non_throw_tasks = std::make_tuple(into_non_throw(std::move(tasks))...);
-
             auto *context = co_await get_current_coroutine_context();
-
-            auto continuation = [state]() mutable {
-                if (state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    if (state->parent_coro) {
-                        state->parent_coro.resume();
-                    }
-                }
-            };
 
             struct awaiter {
                 std::shared_ptr<SharedState> state;
                 execution_context *ctx;
-                decltype(continuation) cont;
 
                 bool await_ready() const noexcept {
                     return sizeof...(T) == 0;
@@ -1023,21 +1034,49 @@ namespace coroutine {
 
                 void await_suspend(std::coroutine_handle<> h) noexcept {
                     state->parent_coro = h;
-                    std::apply([&](auto &&... t) {
-                        (t.get_promise()->set_continuation(cont), ...);
-                        (t.get_promise()->set_execution_context(ctx), ...);
-                        (ctx->resume_promise(t.get_promise()), ...);
-                    }, state->non_throw_tasks);
+
+                    auto local_state = this->state;
+                    auto *local_ctx = this->ctx;
+
+                    std::weak_ptr<SharedState> weak_state = local_state;
+
+                    auto setup_task = [&]<size_t I>(auto &task, std::integral_constant<size_t, I>) {
+                        auto *promise = task.get_promise();
+                        promise->set_execution_context(local_ctx);
+
+                        promise->set_continuation([weak_state]() mutable {
+                            auto locked_state = weak_state.lock();
+                            if (!locked_state) {
+                                return;
+                            }
+
+                            if (locked_state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                                if (locked_state->parent_coro) {
+                                    locked_state->parent_coro.resume();
+                                }
+                            }
+                        });
+
+                        local_ctx->resume_promise(promise);
+                    };
+
+                    std::apply([&](auto &... t) {
+                        [&]<size_t... Is>(std::index_sequence<Is...>) {
+                            (setup_task(t, std::integral_constant<size_t, Is>{}), ...);
+                        }(std::index_sequence_for<T...>{});
+                    }, local_state->non_throw_tasks);
                 }
 
                 void await_resume() const noexcept {}
             };
 
-            co_await awaiter{state, context, continuation};
+            co_await awaiter{state, context};
 
-            co_return std::apply([](auto &&... task) {
+            std::tuple<std::expected<T, std::exception_ptr>...> ret_val = std::apply([](auto &&... task) {
                 return std::make_tuple(task.get_promise()->get_result_move()...);
             }, state->non_throw_tasks);
+
+            co_return ret_val;
         }
 
         template<template<typename> typename TaskType = task, typename T>
@@ -1058,18 +1097,9 @@ namespace coroutine {
                 state->non_throw_tasks.push_back(into_non_throw<TaskType, T>(std::move(t)));
             }
 
-            auto continuation = [state]() mutable {
-                if (state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    if (state->parent_coro) {
-                        state->parent_coro.resume();
-                    }
-                }
-            };
-
             struct awaiter {
                 std::shared_ptr<SharedState> state;
                 execution_context *ctx;
-                decltype(continuation) cont;
 
                 bool await_ready() const noexcept {
                     return state->non_throw_tasks.empty();
@@ -1077,23 +1107,44 @@ namespace coroutine {
 
                 void await_suspend(std::coroutine_handle<> h) noexcept {
                     state->parent_coro = h;
-                    for (auto &t: state->non_throw_tasks) {
-                        t.get_promise()->set_continuation(cont);
-                        t.get_promise()->set_execution_context(ctx);
-                        ctx->resume_promise(t.get_promise());
+
+                    auto local_state = this->state;
+                    auto *local_ctx = this->ctx;
+
+                    std::weak_ptr<SharedState> weak_state = local_state;
+
+                    for (auto &t: local_state->non_throw_tasks) {
+                        auto *promise = t.get_promise();
+                        promise->set_execution_context(local_ctx);
+
+                        promise->set_continuation([weak_state]() mutable {
+                            auto locked_state = weak_state.lock();
+                            if (!locked_state) {
+                                return;
+                            }
+
+                            if (locked_state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                                if (locked_state->parent_coro) {
+                                    locked_state->parent_coro.resume();
+                                }
+                            }
+                        });
+
+                        local_ctx->resume_promise(promise);
                     }
                 }
 
                 void await_resume() const noexcept {}
             };
 
-            co_await awaiter{state, context, continuation};
+            co_await awaiter{state, context};
 
             std::vector<std::expected<T, std::exception_ptr>> results;
             results.reserve(state->non_throw_tasks.size());
             for (auto &t: state->non_throw_tasks) {
                 results.push_back(t.get_promise()->get_result_move());
             }
+
             co_return results;
         }
 
@@ -1101,7 +1152,6 @@ namespace coroutine {
         TaskType<std::tuple<std::optional<std::expected<T, std::exception_ptr>>...>> any_of(TaskType<T>... tasks) {
             struct SharedState {
                 std::atomic_bool ready{false};
-                std::atomic<int> dispatch_flags{0};
                 std::coroutine_handle<> parent_coro;
                 std::tuple<std::optional<std::expected<T, std::exception_ptr>>...> result;
                 std::tuple<TaskType<T>...> kept_tasks;
@@ -1122,58 +1172,49 @@ namespace coroutine {
                 void await_suspend(std::coroutine_handle<> h) noexcept {
                     state->parent_coro = h;
 
+                    auto local_state = this->state;
+                    auto *local_ctx = this->ctx;
+
                     auto setup_task = [&]<size_t I>(auto &task, std::integral_constant<size_t, I>) {
-                        if (!task.has_value()) {
-                            return;
-                        }
-
                         auto *promise = task.get_promise();
-                        if (!promise) {
-                            return;
-                        }
+                        promise->set_execution_context(local_ctx);
 
-                        promise->set_execution_context(ctx);
+                        std::weak_ptr<SharedState> weak_state = local_state;
+                        promise->set_continuation([weak_state, promise]() mutable {
+                            auto locked_state = weak_state.lock();
+                            if (!locked_state) {
+                                return;
+                            }
 
-                        promise->set_continuation([state = this->state, promise]() mutable {
-                            if (!state->ready.exchange(true, std::memory_order_acq_rel)) {
+                            if (!locked_state->ready.exchange(true, std::memory_order_acq_rel)) {
                                 using CurrentT = std::tuple_element_t<I, std::tuple<T...>>;
                                 try {
                                     if constexpr (std::is_same_v<CurrentT, void>) {
                                         promise->get_result_move();
-                                        std::get<I>(state->result) = std::expected<void, std::exception_ptr>{};
+                                        std::get<I>(locked_state->result) = std::expected<void, std::exception_ptr>{};
                                     } else {
-                                        std::get<I>(state->result) = std::expected<CurrentT, std::exception_ptr>{
+                                        std::get<I>(locked_state->result) = std::expected<CurrentT, std::exception_ptr>{
                                             promise->get_result_move()
                                         };
                                     }
                                 } catch (...) {
-                                    std::get<I>(state->result) = std::unexpected{std::current_exception()};
+                                    std::get<I>(locked_state->result) = std::unexpected{std::current_exception()};
                                 }
 
-                                int old_flags = state->dispatch_flags.fetch_or(1, std::memory_order_acq_rel);
-                                if ((old_flags & 2) != 0) {
-                                    if (state->parent_coro) {
-                                        state->parent_coro.resume();
-                                    }
+                                if (locked_state->parent_coro) {
+                                    locked_state->parent_coro.resume();
                                 }
                             }
                         });
 
-                        ctx->resume_promise(promise);
+                        local_ctx->resume_promise(promise);
                     };
 
                     std::apply([&](auto &... t) {
                         [&]<size_t... Is>(std::index_sequence<Is...>) {
                             (setup_task(t, std::integral_constant<size_t, Is>{}), ...);
                         }(std::index_sequence_for<T...>{});
-                    }, state->kept_tasks);
-
-                    int old_flags = state->dispatch_flags.fetch_or(2, std::memory_order_acq_rel);
-                    if ((old_flags & 1) != 0) {
-                        if (state->parent_coro) {
-                            state->parent_coro.resume();
-                        }
-                    }
+                    }, local_state->kept_tasks);
                 }
 
                 void await_resume() const noexcept {}
@@ -1183,10 +1224,6 @@ namespace coroutine {
 
             std::tuple<std::optional<std::expected<T, std::exception_ptr>>...> ret_val = std::move(state->result);
 
-            std::apply([](auto &... t) {
-                (t.reset(), ...);
-            }, state->kept_tasks);
-
             co_return ret_val;
         }
 
@@ -1194,7 +1231,6 @@ namespace coroutine {
         TaskType<std::optional<std::expected<T, std::exception_ptr>>> any_of(std::vector<TaskType<T>> tasks) {
             struct SharedState {
                 std::atomic_bool ready{false};
-                std::atomic<int> dispatch_flags{0};
                 std::coroutine_handle<> parent_coro;
                 std::optional<std::expected<T, std::exception_ptr>> result;
                 std::vector<TaskType<T>> kept_tasks;
@@ -1215,50 +1251,41 @@ namespace coroutine {
                 void await_suspend(std::coroutine_handle<> h) noexcept {
                     state->parent_coro = h;
 
-                    for (auto &task: state->kept_tasks) {
-                        if (!task.has_value()) {
-                            continue;
-                        }
+                    auto local_state = this->state;
+                    auto *local_ctx = this->ctx;
 
+                    for (auto &task: local_state->kept_tasks) {
                         auto *promise = task.get_promise();
-                        if (!promise) {
-                            continue;
-                        }
+                        promise->set_execution_context(local_ctx);
 
-                        promise->set_execution_context(ctx);
+                        std::weak_ptr<SharedState> weak_state = local_state;
+                        promise->set_continuation([weak_state, promise]() mutable {
+                            auto locked_state = weak_state.lock();
+                            if (!locked_state) {
+                                return;
+                            }
 
-                        promise->set_continuation([state = this->state, promise]() mutable {
-                            if (!state->ready.exchange(true, std::memory_order_acq_rel)) {
+                            if (!locked_state->ready.exchange(true, std::memory_order_acq_rel)) {
                                 try {
                                     if constexpr (std::is_same_v<T, void>) {
                                         promise->get_result_move();
-                                        state->result = std::expected<void, std::exception_ptr>{};
+                                        locked_state->result = std::expected<void, std::exception_ptr>{};
                                     } else {
-                                        state->result = std::expected<T, std::exception_ptr>{
+                                        locked_state->result = std::expected<T, std::exception_ptr>{
                                             promise->get_result_move()
                                         };
                                     }
                                 } catch (...) {
-                                    state->result = std::unexpected{std::current_exception()};
+                                    locked_state->result = std::unexpected{std::current_exception()};
                                 }
 
-                                int old_flags = state->dispatch_flags.fetch_or(1, std::memory_order_acq_rel);
-                                if ((old_flags & 2) != 0) {
-                                    if (state->parent_coro) {
-                                        state->parent_coro.resume();
-                                    }
+                                if (locked_state->parent_coro) {
+                                    locked_state->parent_coro.resume();
                                 }
                             }
                         });
 
-                        ctx->resume_promise(promise);
-                    }
-
-                    int old_flags = state->dispatch_flags.fetch_or(2, std::memory_order_acq_rel);
-                    if ((old_flags & 1) != 0) {
-                        if (state->parent_coro) {
-                            state->parent_coro.resume();
-                        }
+                        local_ctx->resume_promise(promise);
                     }
                 }
 
@@ -1269,17 +1296,13 @@ namespace coroutine {
 
             std::optional<std::expected<T, std::exception_ptr>> ret_val = std::move(state->result);
 
-            for (auto &t: state->kept_tasks) {
-                t.reset();
-            }
-
             co_return ret_val;
         }
 
         template<typename T> requires (!std::same_as<T, void>)
         class generator_promise : public promise_base {
         public:
-            std::optional<T> get_resource_move() {
+            std::optional<T> get_result_move() {
                 if (std::coroutine_handle<generator_promise> promise = std::coroutine_handle<
                     generator_promise>::from_promise(*this); promise.done()) {
                     return std::nullopt;
@@ -1354,27 +1377,49 @@ namespace coroutine {
                 return promise->get_resource_move();
             }
 
-            generator &by_promise(promise_base *parent_promise) {
+            auto by_promise(promise_base *parent_promise) {
                 assert(parent_promise);
-                generator_promise<T> *promise = this->get_promise();
-                if (!promise->get_execution_context()) {
-                    promise->set_execution_context(parent_promise->get_execution_context());
-                }
 
-                auto weak_parent_handle = ref_counted_resource_weak_handle(
-                    parent_promise, resource_acquisition_semantics::copy{});
+                struct awaiter {
+                    generator m_generator;
+                    promise_base *m_parent_promise;
 
-                assert(!promise->get_continuation()); // Ensure no continuation is set, or is consumed
-                promise->set_continuation([weak_parent_handle = std::move(weak_parent_handle)]() mutable {
-                    if (auto parent_handle = weak_parent_handle.lock()) {
-                        std::coroutine_handle<promise_base>::from_promise(
-                            *static_cast<promise_base *>(parent_handle.get())).resume();
+                    bool await_ready() const noexcept {
+                        return false;
                     }
-                });
 
-                promise->get_execution_context()->resume_promise(promise);
+                    void await_suspend(std::coroutine_handle<> h) noexcept {
+                        execution_context *context = m_parent_promise->get_execution_context();
+                        assert(context);
 
-                return *this;
+                        auto *promise = m_generator.get_promise();
+                        if (!promise->get_execution_context()) {
+                            promise->set_execution_context(context);
+                        }
+
+                        auto weak_parent = ref_counted_resource_weak_handle(
+                            m_parent_promise, resource_acquisition_semantics::copy{});
+
+                        auto *local_ctx = promise->get_execution_context();
+
+                        promise->set_continuation([weak_parent = std::move(weak_parent)]() mutable {
+                            auto parent = weak_parent.lock();
+                            if (!parent) {
+                                return;
+                            }
+                            auto *p = static_cast<promise_base *>(parent.get());
+                            p->get_execution_context()->resume_promise(p);
+                        });
+
+                        local_ctx->resume_promise(promise);
+                    }
+
+                    decltype(auto) await_resume() {
+                        return m_generator.get_promise()->get_result_move();
+                    }
+                };
+
+                return awaiter{std::move(*this), parent_promise};
             }
         };
 
