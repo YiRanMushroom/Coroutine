@@ -3,25 +3,30 @@
 using coroutine::task;
 using coroutine::cancelable_task;
 
-cancelable_task<void> say1() {
+inline cancelable_task<void> say1() {
     std::cout << 1 << std::endl;
     co_return;
 }
 
-task<void> say2() {
+volatile char *volatile something = nullptr;
+
+inline task<void> say2() {
+    volatile char padding[64];
+    padding[0] = 1;
+    something = padding;
     std::cout << 2 << std::endl;
     co_await say1();
     co_return;
 }
 
-cancelable_task<void> say3() {
-    std::cout << 3 << std::endl;
+inline cancelable_task<void> say3() {
+    // std::cout << 3 << std::endl;
     co_await say2();
-    std::cout << "This should be cancelled";
-    std::this_thread::sleep_for(std::chrono::seconds(5));
-    co_await say1();
-    std::cout << "This should not be printed";
-    co_return;
+    // std::cout << "This should be cancelled";
+    // std::this_thread::sleep_for(std::chrono::seconds(5));
+    // co_await say1();
+    // std::cout << "This should not be printed";
+    // co_return;
 }
 
 // cancelable_task<void> say_but_slow() {
@@ -83,7 +88,7 @@ int main() {
 
             // auto t = say3();
 
-            execution_ctx.block_on(do_many_things(9));
+            execution_ctx.block_on(say3());
         }
         std::cout << std::endl;
 
@@ -92,6 +97,8 @@ int main() {
         //     std::this_thread::sleep_for(std::chrono::milliseconds(100));
         //     say1();
         // }
+
+        say_to_n(1);
 
 
         std::cout << coroutine::_details::debug_get_active_promise_count() << std::endl;

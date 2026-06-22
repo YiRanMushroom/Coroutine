@@ -20,6 +20,12 @@
 #include <generator>
 #endif
 
+#ifdef __clang__
+#define COROUTINE_AWAIT_ELIDABLE [[clang::coro_await_elidable]]
+#else
+#define COROUTINE_AWAIT_ELIDABLE
+#endif
+
 namespace coroutine {
     class execution_context;
 
@@ -348,6 +354,9 @@ namespace coroutine {
             }
 
             inline void pin() {
+                if (m_pinned_self) {
+                    return;
+                }
                 m_pinned_self = ref_counted_resource_handle(this, resource_acquisition_semantics::copy{});
             }
 
@@ -369,18 +378,23 @@ namespace coroutine {
                 std::coroutine_handle<promise_base>::from_promise(*this).destroy();
             }
 
-            bool cancellable() const noexcept {
-                return !m_pinned_self;
-            }
-
         protected:
             inline void on_finished() {}
 
             std::function<void()> m_continuation;
             ref_counted_resource_handle m_pinned_self;
             execution_context *m_execution_context = nullptr;
+            bool cancelable = false;
 
         public:
+            inline bool is_cancelable() const noexcept {
+                return cancelable;
+            }
+
+            inline void set_cancelable(bool value) noexcept {
+                cancelable = value;
+            }
+
             execution_context *get_execution_context() const noexcept {
                 return m_execution_context;
             }
@@ -549,7 +563,8 @@ namespace coroutine {
         };
 
         template<typename T>
-        class task_base : public future_base, public abstract_awaitable_base, public std::suspend_always {
+        class COROUTINE_AWAIT_ELIDABLE task_base : public future_base, public abstract_awaitable_base,
+                                                         public std::suspend_always {
         public:
             using promise_type = promise<T>;
 
@@ -654,11 +669,16 @@ namespace coroutine {
         class task;
 
         template<typename T>
-        class cancelable_task : public task_base<T> {
+        class COROUTINE_AWAIT_ELIDABLE cancelable_task : public task_base<T> {
         public:
             using typename task_base<T>::promise_type;
 
-            using task_base<T>::task_base;
+            cancelable_task(ref_counted_resource_handle coroutine_handle) noexcept : task_base<T>(
+                std::move(coroutine_handle)) {
+                auto *promise = this->get_promise();
+                assert(promise);
+                promise->set_cancelable(true);
+            }
 
             void cancel() {
                 this->m_coroutine_handle.reset();
@@ -676,15 +696,11 @@ namespace coroutine {
         };
 
         template<typename T>
-        class task : public task_base<T> {
+        class COROUTINE_AWAIT_ELIDABLE task : public task_base<T> {
         public:
             using typename task_base<T>::promise_type;
 
-            task(ref_counted_resource_handle coroutine_handle) noexcept : task_base<T>(std::move(coroutine_handle)) {
-                auto *promise = this->get_promise();
-                assert(promise);
-                promise->pin();
-            }
+            task(ref_counted_resource_handle coroutine_handle) noexcept : task_base<T>(std::move(coroutine_handle)) {}
 
             task() = default;
         };
@@ -910,6 +926,10 @@ namespace coroutine {
             }
 
             void resume_promise(promise_base *promise) override {
+                if (!promise->is_cancelable()) {
+                    promise->pin();
+                }
+
                 auto promise_handle = promise->borrow();
                 m_thread_pool->EnqueueFunc([promise_handle]mutable {
                     auto *promise = static_cast<promise_base *>(promise_handle.get());
