@@ -3,14 +3,14 @@
 using coroutine::task;
 using coroutine::cancelable_task;
 
-inline cancelable_task<void> say1() {
+cancelable_task<void> say1() {
     std::cout << 1 << std::endl;
     co_return;
 }
 
 volatile char *volatile something = nullptr;
 
-inline task<void> say2() {
+task<void> say2() {
     volatile char padding[64];
     padding[0] = 1;
     something = padding;
@@ -19,9 +19,10 @@ inline task<void> say2() {
     co_return;
 }
 
-inline cancelable_task<void> say3() {
+cancelable_task<void> say3() {
+    auto* context = co_await coroutine::get_current_coroutine_context();
     // std::cout << 3 << std::endl;
-    co_await say2();
+    co_await say2().with_context(context);
     // std::cout << "This should be cancelled";
     // std::this_thread::sleep_for(std::chrono::seconds(5));
     // co_await say1();
@@ -81,6 +82,13 @@ cancelable_task<void> do_many_things(int n) {
     std::cout << n;
 }
 
+task<void> test_many_asm() {
+    co_await say1();
+    co_await coroutine::all_of(say1(), say1(), say1());
+    co_await coroutine::any_of(say1(), say1(), say1());
+    co_await (say1() | coroutine::_details::_pipe_utils::timeout(std::chrono::milliseconds(100)));
+}
+
 int main() {
     for (int i = 0; i < 200; ++i) {
         {
@@ -88,7 +96,7 @@ int main() {
 
             // auto t = say3();
 
-            execution_ctx.block_on(say3());
+            execution_ctx.block_on(test_many_asm());
         }
         std::cout << std::endl;
 
