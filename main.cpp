@@ -4,7 +4,7 @@ using coroutine::task;
 using coroutine::cancelable_task;
 
 cancelable_task<void> say1() {
-    std::cout << 1 << std::endl;
+    std::cout << 1;
     co_return;
 }
 
@@ -14,13 +14,13 @@ task<void> say2() {
     volatile char padding[64];
     padding[0] = 1;
     something = padding;
-    std::cout << 2 << std::endl;
+    std::cout << 2;
     co_await say1();
     co_return;
 }
 
 cancelable_task<void> say3() {
-    auto* context = co_await coroutine::get_current_coroutine_context();
+    auto *context = co_await coroutine::get_current_coroutine_context();
     // std::cout << 3 << std::endl;
     co_await say2().with_context(context);
     // std::cout << "This should be cancelled";
@@ -84,13 +84,14 @@ cancelable_task<void> do_many_things(int n) {
 
 task<void> test_many_asm() {
     co_await say1();
-    // co_await coroutine::all_of(say1(), say1(), say1());
-    // co_await coroutine::any_of(say1(), say1(), say1());
-    // co_await (say1() | coroutine::with_timeout(std::chrono::milliseconds(100)));
+    co_await coroutine::all_of(say1(), say1(), do_many_things(3));
+    co_await coroutine::any_of(say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1(),
+                               say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1());
+    co_await (say1() | coroutine::with_timeout(std::chrono::milliseconds(0)));
 }
 
 int main() {
-    for (int i = 0; i < 200; ++i) {
+    for (int i = 0; i < 1000; ++i) {
         {
             auto execution_ctx = coroutine::_details::multithreaded_execution_context{};
 
@@ -98,18 +99,10 @@ int main() {
 
             execution_ctx.block_on(test_many_asm());
         }
-        std::cout << std::endl;
-
-        // while (coroutine::_details::debug_get_active_promise_count() > 0) {
-        //     std::cout << std::format("Active promises: {}\n", coroutine::_details::debug_get_active_promise_count()) << std::flush;
-        //     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        //     say1();
-        // }
-
-        say_to_n(1);
+        // std::cout << std::endl;
 
 
-        std::cout << coroutine::_details::debug_get_active_promise_count() << std::endl;
+        std::cout << coroutine::_details::debug_get_active_promise_count();
     }
 
     std::cout << "Heap allocations: " << std::endl;
