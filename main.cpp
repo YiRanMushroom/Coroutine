@@ -84,9 +84,9 @@ cancelable_task<void> do_many_things(int n) {
 
 task<void> test_many_asm() {
     co_await say1();
-    co_await coroutine::all_of(say1(), say1(), say1());
-    co_await coroutine::any_of(say1(), say1(), say1());
-    co_await (say1() | coroutine::with_timeout(std::chrono::milliseconds(100)));
+    // co_await coroutine::all_of(say1(), say1(), say1());
+    // co_await coroutine::any_of(say1(), say1(), say1());
+    // co_await (say1() | coroutine::with_timeout(std::chrono::milliseconds(100)));
 }
 
 int main() {
@@ -111,6 +111,12 @@ int main() {
 
         std::cout << coroutine::_details::debug_get_active_promise_count() << std::endl;
     }
+
+    std::cout << "Heap allocations: " << std::endl;
+
+    std::cout << coroutine::_details::promise_base::g_heap_alloc_count.load(std::memory_order_acquire) << std::endl;
+
+    std::cout << "Active promises: " << std::endl;
 
     std::cout << coroutine::_details::debug_get_active_promise_count() << std::endl;
 }
