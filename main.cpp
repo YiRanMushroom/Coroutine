@@ -21,52 +21,9 @@ task<void> say2() {
 
 cancelable_task<void> say3() {
     auto *context = co_await coroutine::get_current_coroutine_context();
-    // std::cout << 3 << std::endl;
     co_await say2().with_context(context);
-    // std::cout << "This should be cancelled";
-    // std::this_thread::sleep_for(std::chrono::seconds(5));
-    // co_await say1();
-    // std::cout << "This should not be printed";
-    // co_return;
 }
 
-// cancelable_task<void> say_but_slow() {
-//     std::cout << "Starting slow task..." << std::endl;
-//     co_await coroutine::sleep_for(std::chrono::seconds(2));
-//     std::cout << "Finished slow task!" << std::endl;
-//     co_await say1();
-//     co_return;
-// }
-
-// cancelable_task<void> test_and() {
-//     co_await coroutine::all_of(say_but_slow(), say_but_slow(), say_but_slow());
-//     co_return;
-// }
-//
-// task<void> test_or() {
-//     co_await coroutine::any_of<task>(say_but_slow().into(), say_but_slow().into(), say1());
-// }
-
-coroutine::generator<int> count_up_to(int n) {
-    for (int i = 0; i < n; ++i) {
-        co_yield i;
-    }
-}
-
-task<void> say_to_n(int n) {
-    coroutine::generator<int> gen = count_up_to(n);
-
-    std::cout << std::format("Handle {}", (void *) gen.get_promise()) << std::endl;
-
-    std::cout << "Counting up to " << n << ":" << std::endl;
-
-    while (auto result = co_await gen) {
-        auto unwrapped = std::move(result).value();
-        std::cout << std::format("Got value: {0}, handle: {1}\n", unwrapped, (void *) gen.get_promise()) << std::flush;
-    }
-    std::cout << "Done counting!" << std::endl;
-    co_return;
-}
 
 cancelable_task<void> do_many_things(int n) {
     if (n < 2) {
@@ -82,16 +39,18 @@ cancelable_task<void> do_many_things(int n) {
     std::cout << n;
 }
 
-task<void> test_many_asm() {
+cancelable_task<void> test_many_asm() {
     co_await say1();
     co_await coroutine::all_of(say1(), say1(), do_many_things(3));
-    co_await coroutine::any_of(say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1(),
-                               say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1(), say1());
-    co_await (say1() | coroutine::with_timeout(std::chrono::milliseconds(0)));
+    co_await coroutine::any_of(say1(), say1(), say1(), say1(), coroutine::any_of(say1(), say1(), say1(), say1()),
+                               say1(), say1(), say1(),
+                               say1(), say1(), say1(), say1(),
+                               coroutine::any_of(say1(), say1(), say1(), say1(), say1()), say1(), say1());
+    co_await (say1() | coroutine::with_timeout(std::chrono::milliseconds(3)));
 }
 
 int main() {
-    for (int i = 0; i < 1000; ++i) {
+    for (int i = 0; i < 100; ++i) {
         {
             auto execution_ctx = coroutine::_details::multithreaded_execution_context{};
 

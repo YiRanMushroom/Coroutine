@@ -466,12 +466,13 @@ namespace coroutine {
 
         virtual void resume_promise_detached(_details::future_base &&future) = 0;
 
-        virtual void resume_promise_weak(_details::promise_base *promise);
+        virtual void resume_promise_weak(_details::promise_base *promise) = 0;
 
         template<typename T>
         T block_on(_details::task_base<T> task);
-    };
 
+        virtual void wait_idle() = 0;
+    };
 
 
     namespace _details {
@@ -663,7 +664,7 @@ namespace coroutine {
                             p->get_execution_context()->resume_promise_strong(p);
                         });
 
-                        local_ctx->resume_promise(promise);
+                        local_ctx->resume_promise_strong(promise);
                     }
 
                     decltype(auto) await_resume() {
@@ -1022,6 +1023,10 @@ namespace coroutine {
                 m_thread_pool->Join();
             }
 
+
+            void wait_idle() override {
+                // m_thread_pool->Join();
+            }
         private:
             std::shared_ptr<_impl_thread_pool::IThreadPool> m_thread_pool;
         };
@@ -1044,16 +1049,18 @@ namespace coroutine {
         promise->set_continuation(continuation);
         promise->set_execution_context(this);
 
-        resume_promise(promise);
+        resume_promise_strong(promise);
 
         std::unique_lock lock(mtx);
         cv.wait(lock, [&] { return finished; });
+
 
         if constexpr (std::is_same_v<T, void>) {
             task.get_promise()->get_result_move();
         } else {
             return task.get_promise()->get_result_move();
         }
+
     }
 
     // template<typename T>
@@ -1082,7 +1089,7 @@ namespace coroutine {
     //     promise->set_continuation(std::move(continuation));
     //     promise->set_execution_context(this);
     //
-    //     resume_promise(promise);
+    //     resume_promise_strong(promise);
     // }
 
     template<typename T>
@@ -1190,11 +1197,11 @@ namespace coroutine {
         //
         //                     if (local_state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         //                         if (local_state->parent_promise) {
-        //                             local_ctx->resume_promise(local_state->parent_promise);
+        //                             local_ctx->resume_promise_strong(local_state->parent_promise);
         //                         }
         //                     }
         //                 });
-        //                 local_ctx->resume_promise(promise);
+        //                 local_ctx->resume_promise_strong(promise);
         //             };
         //
         //
@@ -1261,11 +1268,11 @@ namespace coroutine {
         //
         //                     if (local_state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         //                         if (local_state->parent_promise) {
-        //                             local_ctx->resume_promise(local_state->parent_promise);
+        //                             local_ctx->resume_promise_strong(local_state->parent_promise);
         //                         }
         //                     }
         //                 });
-        //                 local_ctx->resume_promise(promise);
+        //                 local_ctx->resume_promise_strong(promise);
         //             }
         //         }
         //
@@ -1336,11 +1343,11 @@ namespace coroutine {
         //                             std::get<I>(local_state->result) = std::unexpected{std::current_exception()};
         //                         }
         //                         if (local_state->parent_promise) {
-        //                             local_ctx->resume_promise(local_state->parent_promise);
+        //                             local_ctx->resume_promise_strong(local_state->parent_promise);
         //                         }
         //                     }
         //                 });
-        //                 local_ctx->resume_promise(promise);
+        //                 local_ctx->resume_promise_strong(promise);
         //             };
         //
         //             std::apply([&](auto &... t) {
@@ -1412,11 +1419,11 @@ namespace coroutine {
         //                             local_state->result = std::unexpected{std::current_exception()};
         //                         }
         //                         if (local_state->parent_promise) {
-        //                             local_ctx->resume_promise(local_state->parent_promise);
+        //                             local_ctx->resume_promise_strong(local_state->parent_promise);
         //                         }
         //                     }
         //                 });
-        //                 local_ctx->resume_promise(promise);
+        //                 local_ctx->resume_promise_strong(promise);
         //             }
         //         }
         //
@@ -1516,10 +1523,10 @@ namespace coroutine {
                         auto *local_ctx = parent_prom->get_execution_context();
 
                         if (local_state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                            local_ctx->resume_promise(parent_prom);
+                            local_ctx->resume_promise_strong(parent_prom);
                         }
                     });
-                    local_ctx->resume_promise(promise);
+                    local_ctx->resume_promise_strong(promise);
                 };
 
                 std::apply([&](auto &... t) {
@@ -1561,10 +1568,10 @@ namespace coroutine {
                         auto *local_ctx = parent_prom->get_execution_context();
 
                         if (local_state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                            local_ctx->resume_promise(parent_prom);
+                            local_ctx->resume_promise_strong(parent_prom);
                         }
                     });
-                    local_ctx->resume_promise(promise);
+                    local_ctx->resume_promise_strong(promise);
                 }
             }
 
@@ -1613,10 +1620,10 @@ namespace coroutine {
                             } catch (...) {
                                 std::get<I>(local_state->result) = std::unexpected{std::current_exception()};
                             }
-                            local_ctx->resume_promise(parent_prom);
+                            local_ctx->resume_promise_strong(parent_prom);
                         }
                     });
-                    local_ctx->resume_promise(promise);
+                    local_ctx->resume_promise_strong(promise);
                 };
 
                 std::apply([&](auto &... t) {
@@ -1671,10 +1678,10 @@ namespace coroutine {
                             } catch (...) {
                                 local_state->result = std::unexpected{std::current_exception()};
                             }
-                            local_ctx->resume_promise(parent_prom);
+                            local_ctx->resume_promise_strong(parent_prom);
                         }
                     });
-                    local_ctx->resume_promise(promise);
+                    local_ctx->resume_promise_strong(promise);
                 }
             }
 
@@ -1762,17 +1769,14 @@ namespace coroutine {
             using RetType = std::tuple<std::optional<std::expected<T, std::exception_ptr>>...>;
 
             struct SharedState {
-                using RetType = std::tuple<std::optional<std::expected<T, std::exception_ptr>>...>;
-                std::atomic_bool ready{false};
-
-                // 【核心修改】你的计数器逻辑：N 个任务 + 1 个主派发线程
-                std::atomic_size_t remaining{sizeof...(T) + 1};
-
+                std::atomic_int sync{0};
                 std::tuple<task_base<T>...> kept_tasks;
                 RetType result;
 
                 void release_resources() noexcept {
-                    kept_tasks = {};
+                    std::apply([](auto &... t) {
+                        (t.reset(), ...);
+                    }, kept_tasks);
                 }
             };
 
@@ -1782,72 +1786,87 @@ namespace coroutine {
                 SharedState *local_state = &ex_prom->m_state;
 
                 local_state->kept_tasks = std::make_tuple(std::move(tasks_impl)...);
-                auto weak_self = ref_counted_resource_weak_handle(base_promise, resource_acquisition_semantics::copy{});
+                execution_context *local_ctx = base_promise->get_execution_context();
 
                 struct awaiter {
-                    SharedState *local_state;
-                    ref_counted_resource_weak_handle weak_self;
-                    execution_context *local_ctx;
-                    promise_base *target_promise;
+                    SharedState *state;
+                    execution_context *ctx;
+                    promise_base *target;
 
                     bool await_ready() const noexcept { return false; }
 
                     void await_suspend(std::coroutine_handle<>) noexcept {
-                        auto setup_task = [this]<size_t I>(auto &task_item, std::integral_constant<size_t, I>) {
+                        auto setup_task = [this]<size_t I>(auto &task_item,
+                                                           std::integral_constant<size_t, I>) -> promise_base * {
                             auto *promise = task_item.get_promise();
-                            assert(promise);
-                            promise->set_execution_context(local_ctx);
+                            promise->set_execution_context(ctx);
+                            auto weak_p = ref_counted_resource_weak_handle(
+                                target, resource_acquisition_semantics::copy{});
 
                             promise->set_continuation(
-                                [state = local_state, ctx = local_ctx, target = target_promise, promise]() mutable {
-                                    if (!state->ready.exchange(true, std::memory_order_acq_rel)) {
+                                [this_state = state, this_ctx = ctx, this_target = target, weak_p = std::move(weak_p),
+                                    promise]() mutable {
+                                    auto locked_parent = weak_p.lock();
+                                    if (!locked_parent) {
+                                        return;
+                                    }
+
+                                    int prev = this_state->sync.fetch_or(1, std::memory_order_acq_rel);
+
+                                    if (!(prev & 1)) {
                                         using CurrentT = typename std::remove_pointer_t<decltype(promise)>::value_type;
                                         try {
                                             if constexpr (std::is_same_v<CurrentT, void>) {
                                                 promise->get_result_move();
-                                                std::get<I>(state->result) = std::expected<void, std::exception_ptr>{};
+                                                std::get<I>(this_state->result) = std::expected<void,
+                                                    std::exception_ptr>{};
                                             } else {
-                                                std::get<I>(state->result) = std::expected<CurrentT, std::exception_ptr>
-                                                {
+                                                std::get<I>(this_state->result) = std::expected<CurrentT,
+                                                    std::exception_ptr>{
                                                     promise->get_result_move()
                                                 };
                                             }
                                         } catch (...) {
-                                            std::get<I>(state->result) = std::unexpected{std::current_exception()};
+                                            std::get<I>(this_state->result) = std::unexpected{std::current_exception()};
+                                        }
+
+                                        if (prev & 2) {
+                                            this_ctx->resume_promise_weak(this_target);
                                         }
                                     }
-
-                                    if (state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                                        ctx->resume_promise_strong(target);
-                                    }
                                 });
+                            return promise;
                         };
 
-                        std::apply([setup_task](auto &... t) {
-                            [&]<size_t... Is>(std::index_sequence<Is...>) {
-                                (setup_task(t, std::integral_constant<size_t, Is>{}), ...);
+                        auto local_promises = std::apply([setup_task](auto &&... t) {
+                            return [&]<size_t... Is>(std::index_sequence<Is...>) {
+                                return std::array<promise_base *, sizeof...(t)>{
+                                    setup_task(t, std::integral_constant<size_t, Is>{})...
+                                };
                             }(std::index_sequence_for<decltype(t)...>{});
-                        }, local_state->kept_tasks);
+                        }, state->kept_tasks);
 
-                        auto launch_task = [this](auto &task_item) {
-                            local_ctx->resume_promise_detached(std::move(task_item));
-                        };
+                        for (auto *p: local_promises) {
+                            if (p) {
+                                ctx->resume_promise_weak(p);
+                            }
+                        }
 
-                        std::apply([launch_task](auto &... t) {
-                            (launch_task(t), ...);
-                        }, local_state->kept_tasks);
+                        int prev = state->sync.fetch_or(2, std::memory_order_acq_rel);
 
-                        if (local_state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                            local_ctx->resume_promise_strong(target_promise);
+                        if (prev & 1) {
+                            ctx->resume_promise_weak(target);
                         }
                     }
 
                     void await_resume() const noexcept {}
                 };
 
-                co_await awaiter{local_state, weak_self, base_promise->get_execution_context(), base_promise};
+                co_await awaiter{local_state, local_ctx, base_promise};
 
-                co_return std::move(local_state->result);
+                RetType final_result = std::move(local_state->result);
+                local_state->release_resources();
+                co_return std::move(final_result);
             };
 
             return impl(std::move(tasks)...).release_handle();
@@ -1905,10 +1924,10 @@ namespace coroutine {
                                     } catch (...) {
                                         local_state->result = std::unexpected{std::current_exception()};
                                     }
-                                    local_state->ctx->resume_promise(local_state->target_promise);
+                                    local_state->ctx->resume_promise_strong(local_state->target_promise);
                                 }
                             });
-                            local_state->ctx->resume_promise(promise);
+                            local_state->ctx->resume_promise_strong(promise);
                         }
                     }
 
@@ -2103,7 +2122,7 @@ namespace coroutine {
                             p->get_execution_context()->resume_promise_strong(p);
                         });
 
-                        local_ctx->resume_promise(promise);
+                        local_ctx->resume_promise_strong(promise);
                     }
 
                     decltype(auto) await_resume() {
