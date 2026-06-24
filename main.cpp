@@ -3,26 +3,26 @@
 using coroutine::task;
 using coroutine::cancelable_task;
 
-cancelable_task<void> say1() {
+task<void> say1() {
     std::cout << 1;
     co_return;
 }
 
-volatile char *volatile something = nullptr;
-
-task<void> say2() {
-    volatile char padding[64];
-    padding[0] = 1;
-    something = padding;
-    std::cout << 2;
-    co_await say1();
-    co_return;
-}
-
-cancelable_task<void> say3() {
-    auto *context = co_await coroutine::get_current_coroutine_context();
-    co_await say2().with_context(context);
-}
+// volatile char *volatile something = nullptr;
+//
+// task<void> say2() {
+//     volatile char padding[64];
+//     padding[0] = 1;
+//     something = padding;
+//     std::cout << 2;
+//     co_await say1();
+//     co_return;
+// }
+//
+// cancelable_task<void> say3() {
+//     auto *context = co_await coroutine::get_current_coroutine_context();
+//     co_await say2().with_context(context);
+// }
 
 
 cancelable_task<void> do_many_things(int n) {
@@ -39,24 +39,30 @@ cancelable_task<void> do_many_things(int n) {
     std::cout << n;
 }
 
-cancelable_task<void> test_many_asm() {
-    co_await say1();
-    co_await coroutine::all_of(say1(), say1(), do_many_things(3));
-    co_await coroutine::any_of(say1(), say1(), say1(), say1(), coroutine::any_of(say1(), say1(), say1(), say1()),
-                               say1(), say1(), say1(),
-                               say1(), say1(), say1(), say1(),
-                               coroutine::any_of(say1(), say1(), say1(), say1(), say1()), say1(), say1());
-    co_await (say1() | coroutine::with_timeout(std::chrono::milliseconds(3)));
-}
+// task<void> test_many_asm() {
+//     co_await say1();
+//     co_await say1();
+//     co_await say1();
+//     co_await say1();
+//     co_await say1();
+//     co_await say1();
+//     co_await say1();
+//     co_await say1();
+//     co_await say1();
+//     co_await say1();
+// }
 
 int main() {
-    for (int i = 0; i < 100; ++i) {
+    for (int i = 0; i < 1; ++i) {
         {
-            auto execution_ctx = coroutine::_details::multithreaded_execution_context{};
+            std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
+
+            auto execution_ctx = coroutine::_details::multithreaded_execution_context{1};
 
             // auto t = say3();
 
-            execution_ctx.block_on(test_many_asm());
+
+            execution_ctx.block_on(say1());
         }
         // std::cout << std::endl;
 
