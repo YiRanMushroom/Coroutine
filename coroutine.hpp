@@ -605,8 +605,8 @@ namespace coroutine {
 
         virtual void resume_promise_weak(_details::promise_base *promise) = 0;
 
-        template<typename T>
-        T block_on(_details::task_base<T> &&task);
+        template<template<typename> typename TaskType, typename T>
+        T block_on(TaskType<T> &&task);
 
         virtual void wait_idle() = 0;
     };
@@ -740,12 +740,18 @@ namespace coroutine {
         public:
             using promise_type = promise<T>;
 
+            using value_type = T;
+
             ~task_base() {
                 // std::cout << std::format("destroying {}", typeid(*this).name()) << std::endl;
                 // __debugbreak();
             }
 
             task_base() = default;
+
+            task_base(const task_base &) = delete;
+
+            task_base &operator=(const task_base &) = delete;
 
             task_base(task_base &&) = default;
 
@@ -867,7 +873,7 @@ namespace coroutine {
         public:
             using typename task_base<T>::promise_type;
 
-            cancelable_task(ref_counted_resource_handle coroutine_handle) noexcept : task_base<T>(
+            cancelable_task(ref_counted_resource_handle &&coroutine_handle) noexcept : task_base<T>(
                 std::move(coroutine_handle)) {
                 auto *promise = this->get_promise();
                 assert(promise);
@@ -879,6 +885,14 @@ namespace coroutine {
             }
 
             cancelable_task() = default;
+
+            cancelable_task(const cancelable_task &) = delete;
+
+            cancelable_task &operator=(const cancelable_task &) = delete;
+
+            cancelable_task(cancelable_task &&) = default;
+
+            cancelable_task &operator=(cancelable_task &&) = default;
 
             operator task<T>() && {
                 return task<T>(std::move(this->m_coroutine_handle));
@@ -894,13 +908,21 @@ namespace coroutine {
         public:
             using typename task_base<T>::promise_type;
 
-            task(ref_counted_resource_handle coroutine_handle) noexcept : task_base<T>(std::move(coroutine_handle)) {
+            task(ref_counted_resource_handle &&coroutine_handle) noexcept : task_base<T>(std::move(coroutine_handle)) {
             }
 
             task() = default;
 
+            task(const task &) = delete;
+
+            task &operator=(const task &) = delete;
+
+            task(task &&) = default;
+
+            task &operator=(task &&) = default;
+
             template<std::derived_from<task_base<T>>>
-            task(task_base<T> base) noexcept : task<T>(std::move(base).release_handle()) {
+            task(task_base<T> &&base) noexcept : task<T>(std::move(base).release_handle()) {
             }
         };
 
@@ -1181,8 +1203,8 @@ namespace coroutine {
         };
     }
 
-    template<typename T>
-    T execution_context::block_on(_details::task_base<T> &&task) {
+    template<template<typename> typename TaskType, typename T>
+    T execution_context::block_on(TaskType<T> &&task) {
         std::condition_variable cv;
         std::mutex mtx;
         bool finished = false;
@@ -1286,16 +1308,15 @@ namespace coroutine {
         inline get_coroutine_info_type get_current_coroutine_info() { return {}; }
 
 
-        template<template<typename> typename TaskType, typename T>
-        TaskType<std::expected<T, std::exception_ptr>> into_non_throw(
-            COROUTINE_AWAIT_ELIDABLE_ARGUMENT TaskType<T> &&task) {
+        template<template<typename...> typename TaskType, typename T, typename ... Rest>
+        TaskType<std::expected<T, std::exception_ptr>, Rest...> into_non_throw(
+            COROUTINE_AWAIT_ELIDABLE_ARGUMENT TaskType<T, Rest...> &&task) {
             try {
                 if constexpr (std::is_same_v<T, void>) {
-                    co_await std::move(task);
+                    co_await task;
                     co_return std::expected<void, std::exception_ptr>{};
                 } else {
-                    T result = co_await std::move(task);
-                    co_return std::expected<T, std::exception_ptr>{std::move(result)};
+                    co_return std::expected<T, std::exception_ptr>{co_await task};
                 }
             } catch (...) {
                 co_return std::unexpected{std::current_exception()};
@@ -1588,6 +1609,7 @@ namespace coroutine {
         class COROUTINE_AWAIT_ELIDABLE ex_task : public task_base<T> {
         public:
             using promise_type = ex_promise<T, S>;
+            using typename task_base<T>::value_type;
 
             ex_task() = default;
 
@@ -1861,7 +1883,7 @@ namespace coroutine {
                     return immediate_value_task{std::coroutine_handle<promise_type>::from_promise(*this)};
                 }
 
-                void return_value(COROUTINE_AWAIT_ELIDABLE_ARGUMENT T&& v) {
+                void return_value(COROUTINE_AWAIT_ELIDABLE_ARGUMENT T &&v) {
                     value = std::move(v);
                 }
 
@@ -1904,10 +1926,10 @@ namespace coroutine {
             }
         };
 
-        template<template<typename> typename TaskType, typename T>
-        immediate_value_task<TaskType<T>> force_await_embed_in_current_frame(
+        template<typename Task>
+        immediate_value_task<Task> force_await_embed_in_current_frame(
             COROUTINE_AWAIT_ELIDABLE_ARGUMENT
-            TaskType<T> &&task) {
+            Task &&task) {
             co_return task;
         }
 
@@ -1918,13 +1940,13 @@ namespace coroutine {
             std::tuple<task_base<std::expected<T, std::exception_ptr>>...> non_throw_tasks;
         };
 
-        template<template<typename> typename... TaskType, typename... T>
-        ex_task<std::tuple<std::expected<T, std::exception_ptr>...>, all_of_args_shared_state<T...>> all_of(
+        template<typename... Tasks>
+        ex_task<std::tuple<std::expected<typename Tasks::value_type, std::exception_ptr>...>, all_of_args_shared_state<Tasks...>> all_of(
             COROUTINE_AWAIT_ELIDABLE_ARGUMENT
-            TaskType<T> &&... tasks) {
-            using RetType = std::tuple<std::expected<T, std::exception_ptr>...>;
-            using promise_type = ex_promise<RetType, all_of_args_shared_state<T...>>;
-            using stored_state_type = all_of_args_shared_state<T...>;
+            Tasks &&... tasks) {
+            using RetType = std::tuple<std::expected<typename Tasks::value_type, std::exception_ptr>...>;
+            using promise_type = ex_promise<RetType, all_of_args_shared_state<typename Tasks::value_type...>>;
+            using stored_state_type = all_of_args_shared_state<typename Tasks::value_type...>;
 
             auto *promise = static_cast<promise_type *>(co_await get_current_promise());
             stored_state_type *state = &promise->state;
@@ -1966,7 +1988,7 @@ namespace coroutine {
                     [&setup_and_start_task, state]<size_t... Is>(std::index_sequence<Is...>) {
                         (setup_and_start_task(std::get<Is>(state->non_throw_tasks).get_promise(),
                                               std::integral_constant<size_t, Is>{}), ...);
-                    }(std::index_sequence_for<T...>{});
+                    }(std::index_sequence_for<typename Tasks::value_type...>{});
                 });
 
             RetType ret_val = [state]<size_t... Is>(std::index_sequence<Is...>) {
@@ -1974,7 +1996,7 @@ namespace coroutine {
                     auto task_moved = std::move(std::get<I>(state->non_throw_tasks));
                     return task_moved.get_promise()->get_result_move();
                 }(std::integral_constant<size_t, Is>{})...);
-            }(std::index_sequence_for<T...>{});
+            }(std::index_sequence_for<typename Tasks::value_type...>{});
 
             co_return ret_val;
         }

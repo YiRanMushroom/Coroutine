@@ -40,7 +40,7 @@ cancelable_task<void> do_many_things(int n) {
 }
 
 task<void> test_many_asm() {
-    co_await coroutine::all_of(say1());
+    co_await coroutine::all_of(coroutine::all_of(say1(), say1()), coroutine::all_of(say1(), say1()));
 
     co_return;
 }
