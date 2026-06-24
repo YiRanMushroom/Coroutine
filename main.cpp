@@ -4,7 +4,7 @@ using coroutine::task;
 using coroutine::cancelable_task;
 
 task<void> say1() {
-    std::cout << 1;
+    // std::cout << 1;
     co_return;
 }
 
@@ -39,30 +39,20 @@ cancelable_task<void> do_many_things(int n) {
     std::cout << n;
 }
 
-// task<void> test_many_asm() {
-//     co_await say1();
-//     co_await say1();
-//     co_await say1();
-//     co_await say1();
-//     co_await say1();
-//     co_await say1();
-//     co_await say1();
-//     co_await say1();
-//     co_await say1();
-//     co_await say1();
-// }
+task<void> test_many_asm() {
+    co_await coroutine::all_of(say1());
+
+    co_return;
+}
 
 int main() {
-    for (int i = 0; i < 1; ++i) {
+    for (int i = 0; i < 100; ++i) {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
-            auto execution_ctx = coroutine::_details::multithreaded_execution_context{1};
+            auto execution_ctx = coroutine::_details::multithreaded_execution_context{};
 
-            // auto t = say3();
-
-
-            execution_ctx.block_on(say1());
+            execution_ctx.block_on(test_many_asm());
         }
         // std::cout << std::endl;
 
