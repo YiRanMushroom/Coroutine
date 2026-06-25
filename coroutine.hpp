@@ -28,7 +28,7 @@
 
 #include "thread_pool/thread_pool.h"
 
-#define DO_HALO 0
+#define DO_HALO 1
 #if DO_HALO
 #if __clang__
 #define COROUTINE_AWAIT_ELIDABLE [[clang::coro_await_elidable]]

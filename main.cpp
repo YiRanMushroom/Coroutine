@@ -41,22 +41,23 @@ cancelable_task<void> do_many_things(int n) {
 }
 
 task<void> test_many_asm() {
-    co_await coroutine::all_of(
-        coroutine::all_of(coroutine::all_of(say1(), say1(), say1(), say1()), coroutine::all_of(say1(), say1())),
-        coroutine::all_of(coroutine::all_of(coroutine::all_of(say1(), say1()), say1(), say1()),
-                          coroutine::all_of(say1(), say1())));
-    co_await coroutine::all_of(coroutine::all_of(
-        coroutine::all_of(
-            coroutine::all_of(
-                coroutine::all_of(
-                    coroutine::all_of(
-                        coroutine::all_of(
-                            coroutine::all_of(
-                                coroutine::all_of(
-                                    coroutine::all_of(
-                                        coroutine::all_of(
-                                            coroutine::all_of(
-                                                coroutine::all_of(
+    co_await coroutine::any_of(
+        coroutine::any_of(coroutine::any_of(say1(), say1(), say1(), say1()), coroutine::any_of(say1(), say1())),
+        coroutine::any_of(coroutine::any_of(coroutine::any_of(say1(), say1()), say1(), say1()),
+                          coroutine::any_of(say1(), say1())));
+    co_await coroutine::any_of(coroutine::any_of(say1(),
+        coroutine::any_of(
+            say1(),
+            coroutine::any_of(say1(),
+                coroutine::any_of(say1(),
+                    coroutine::any_of(say1(),
+                        coroutine::any_of(say1(),
+                            coroutine::any_of(say1(),
+                                coroutine::any_of(say1(),
+                                    coroutine::any_of(say1(),
+                                        coroutine::any_of(say1(),
+                                            coroutine::any_of(say1(),
+                                                coroutine::any_of(say1(),
                                                     say1()),
                                                 say1()), say1()), say1()), say1()),
                                 say1(), say1(), say1()),
@@ -68,11 +69,11 @@ task<void> test_many_asm() {
 }
 
 int main() {
-    for (int i = 0; i < 100000; ++i) {
+    for (int i = 0; i < 1000; ++i) {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
-            auto execution_ctx = coroutine::_details::multithreaded_execution_context{4};
+            auto execution_ctx = coroutine::_details::multithreaded_execution_context{1};
 
             execution_ctx.block_on(test_many_asm());
         }

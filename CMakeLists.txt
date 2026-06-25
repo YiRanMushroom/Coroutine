@@ -3,8 +3,25 @@ project(Coroutine)
 
 set(CMAKE_CXX_STANDARD 23)
 
+add_library(asan_profile INTERFACE)
+
+option(ENABLE_ASAN "Enable AddressSanitizer" ON)
+
+if(ENABLE_ASAN)
+    if(MSVC)
+        target_compile_options(asan_profile INTERFACE /fsanitize=address)
+        target_link_options(asan_profile INTERFACE /fsanitize=address)
+
+    else()
+        target_compile_options(asan_profile INTERFACE -fsanitize=address -fno-omit-frame-pointer)
+        target_link_options(asan_profile INTERFACE -fsanitize=address)
+    endif()
+endif()
+
 add_executable(Coroutine main.cpp
         coroutine.hpp)
+
+target_link_libraries(Coroutine PRIVATE asan_profile)
 
 # target is 64 bits
 #target_compile_options(Coroutine PRIVATE -m64)
