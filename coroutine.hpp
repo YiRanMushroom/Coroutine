@@ -28,6 +28,8 @@
 
 #include "thread_pool/thread_pool.h"
 
+#define DO_HALO 0
+#if DO_HALO
 #if __clang__
 #define COROUTINE_AWAIT_ELIDABLE [[clang::coro_await_elidable]]
 #define COROUTINE_AWAIT_ELIDABLE_ARGUMENT [[clang::coro_await_elidable_argument]]
@@ -35,9 +37,10 @@
 #define COROUTINE_AWAIT_ELIDABLE
 #define COROUTINE_AWAIT_ELIDABLE_ARGUMENT
 #endif
-
-// #define COROUTINE_AWAIT_ELIDABLE
-// #define COROUTINE_AWAIT_ELIDABLE_ARGUMENT
+#else
+#define COROUTINE_AWAIT_ELIDABLE
+#define COROUTINE_AWAIT_ELIDABLE_ARGUMENT
+#endif
 
 #if DO_DEBUG_PRINT
 #define debug_print(...) \
@@ -835,7 +838,7 @@ namespace coroutine {
                     task_base<T> *m_task;
                     promise_base *m_parent_promise;
 
-                    std::binary_semaphore m_submitted{0};
+                    // std::binary_semaphore m_submitted{0};
 
                     bool await_ready() const noexcept {
                         return false;
@@ -867,11 +870,11 @@ namespace coroutine {
 
                         local_ctx->resume_promise_weak(promise);
 
-                        m_submitted.release();
+                        // m_submitted.release();
                     }
 
                     auto await_resume() {
-                        m_submitted.acquire();
+                        // m_submitted.acquire();
                         return m_task->get_promise()->get_result_move();
                     }
                 };
