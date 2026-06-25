@@ -517,9 +517,9 @@ namespace coroutine {
                 // std::cout << "destroyed promise at " << self_addr << std::endl;
             }
 
-        protected:
+        public:
             void finalize_finished_promise() {
-                auto handle = this->get_coroutine_handle();
+                // auto handle = this->get_coroutine_handle();
                 // assert(handle.done());
                 this->unpin();
                 auto moved = std::move(*this).get_continuation();
@@ -529,11 +529,12 @@ namespace coroutine {
             }
 
             inline void on_finished() {
-                if (this->should_try_finalize()) {
-                    finalize_finished_promise();
-                }
+                // if (this->should_try_finalize()) {
+                //     finalize_finished_promise();
+                // }
             }
 
+        protected:
             std::function<void()> m_continuation;
             ref_counted_resource_handle m_pinned_self;
             execution_context *m_execution_context = nullptr;
@@ -994,6 +995,12 @@ namespace coroutine {
                         __debugbreak();
                         debug_print("Promise at {:p} has no coroutine handle or is already done.\n",
                                     static_cast<void *>(promise));
+                    }
+
+                    if (handle.done()) {
+                        if (promise->should_try_finalize()) {
+                            promise->finalize_finished_promise();
+                        }
                     }
                 });
             }
