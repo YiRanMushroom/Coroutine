@@ -73,7 +73,7 @@ int main() {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
-            auto execution_ctx = coroutine::_details::multithreaded_execution_context{4};
+            auto execution_ctx = coroutine::_details::multithreaded_execution_context{1};
 
             execution_ctx.block_on(test_many_asm());
         }
