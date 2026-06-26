@@ -69,11 +69,11 @@ task<void> test_many_asm() {
 }
 
 int main() {
-    for (int i = 0; i < 1000; ++i) {
+    for (int i = 0; i < 100000; ++i) {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
-            auto execution_ctx = coroutine::_details::multithreaded_execution_context{1};
+            auto execution_ctx = coroutine::_details::multithreaded_execution_context{4};
 
             execution_ctx.block_on(test_many_asm());
         }

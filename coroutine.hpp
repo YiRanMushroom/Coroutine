@@ -76,12 +76,16 @@ namespace coroutine {
             std::atomic_uint32_t m_strong_count{1};
             std::atomic_uint32_t m_weak_count{1};
 
+        public:
+            pin_resource_base() {
+            }
+
         protected:
             virtual void release_resources() noexcept = 0;
 
             virtual void destroy() noexcept = 0;
 
-            virtual ~pin_resource_base() {
+            ~pin_resource_base() {
                 // std::cout << std::format("destroying pin_resource_base at {:p}\n", static_cast<void *>(this)) <<
                 //         std::endl;
                 debug_print("destroying pin_resource_base at {:p}", static_cast<void *>(this));
@@ -256,8 +260,8 @@ namespace coroutine {
                 // std::cout << std::format("Handle {} to resource at {} is being destroyed.",
                 //          static_cast<void *>(this), static_cast<void *>(m_resource)) << std::endl;
 
-                if (m_resource) {
-                    m_resource->release_strong_reference();
+                if (auto resource = std::exchange(m_resource, nullptr)) {
+                    resource->release_strong_reference();
                 }
             }
 
@@ -339,8 +343,8 @@ namespace coroutine {
             }
 
             ~ref_counted_resource_weak_handle() noexcept {
-                if (m_resource) {
-                    m_resource->release_weak_reference();
+                if (auto resource = std::exchange(m_resource, nullptr)) {
+                    resource->release_weak_reference();
                 }
             }
 
@@ -426,7 +430,7 @@ namespace coroutine {
             friend class task_base;
 
         protected:
-            ~promise_base() override {
+            ~promise_base() {
                 // std::cout << std::format("destroying promise_base at {:p}\n", static_cast<void *>(this)) << std::endl;
 
                 // __debugbreak();
@@ -511,17 +515,23 @@ namespace coroutine {
 
         protected:
             void release_resources() noexcept override {
-                auto self = std::move(m_pinned_self);
+                auto weak_self = weak_borrow();
+                m_pinned_self.reset();
             }
 
             inline void destroy() noexcept override {
                 // std::cout << "destroying promise at " << self_addr << std::endl;
 
-                this->unpin();
+                // this->unpin();
+
+                assert(!m_pinned_self);
 
                 // std::cout << std::format("m_pinned_self is :{}", (void *) this->m_pinned_self.get()) << std::endl;
 
                 // std::cout << std::format("m_coroutine_handle is :{}", this->m_coroutine_handle.address()) << std::endl;
+
+                auto moved_parent = std::move(this->m_parent_handle);
+                this->m_parent_handle.reset();
 
                 this->m_coroutine_handle.destroy();
                 // std::cout << "destroyed promise at " << self_addr << std::endl;
@@ -660,7 +670,7 @@ namespace coroutine {
         template<typename T>
         class promise : public promise_base {
         public:
-            ~promise() override {
+            ~promise() {
                 // std::cout << std::format("destroying promise<{}> at {:p}\n", typeid(T).name(),
                 //                          static_cast<void *>(this)) << std::endl;
             }
@@ -724,7 +734,7 @@ namespace coroutine {
         template<>
         class promise<void> : public promise_base {
         public:
-            ~promise() override = default;
+            ~promise() = default;
 
             promise() = default;
 
