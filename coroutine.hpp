@@ -26,6 +26,8 @@
 #include <generator>
 #endif
 
+#include <shared_mutex>
+
 #include "thread_pool/thread_pool.h"
 
 #define DO_HALO 1
@@ -652,6 +654,10 @@ namespace coroutine {
         template<template<typename...> typename TaskType, typename T>
         std::future<T> async_execute(TaskType<T> task);
 
+        virtual void lock() = 0;
+
+        virtual void unlock() = 0;
+
         virtual void wait_idle() = 0;
     };
 
@@ -995,8 +1001,7 @@ namespace coroutine {
         class multithreaded_execution_context : public execution_context {
         public:
             explicit multithreaded_execution_context(uint32_t thread_count = std::jthread::hardware_concurrency() * 2)
-                : m_thread_count(thread_count),
-                  m_thread_pool(std::make_unique<dp_thread_pool::thread_pool<>>(thread_count)) {}
+                : m_thread_pool(std::make_unique<dp_thread_pool::thread_pool<>>(thread_count)) {}
 
 
             void resume_promise_weak(_details::promise_base *promise) override {
@@ -1021,7 +1026,9 @@ namespace coroutine {
                 });
             }
 
-            ~multithreaded_execution_context() override = default;
+            ~multithreaded_execution_context() override {
+                std::unique_lock lock(m_lock);
+            }
 
 
             void wait_idle() override {
@@ -1029,9 +1036,19 @@ namespace coroutine {
                 m_thread_pool->clear_tasks();
             }
 
+            void lock() override {
+                m_lock.lock_shared();
+            }
+
+            void unlock() override {
+                m_lock.unlock_shared();
+            }
+
+
         private:
-            size_t m_thread_count = 0;
             std::unique_ptr<dp_thread_pool::thread_pool<>> m_thread_pool;
+
+            std::shared_mutex m_lock;
         };
     }
 
@@ -1064,7 +1081,16 @@ namespace coroutine {
 
     template<template <typename...> class TaskType, typename T>
     std::future<T> execution_context::async_execute(TaskType<T> task) {
+        this->lock();
         return std::async(std::launch::async, [this, task = std::move(task)]() mutable {
+            struct unlock_guard {
+                execution_context *ctx;
+
+                ~unlock_guard() {
+                    ctx->unlock();
+                }
+            } guard{this};
+
             return this->block_on(std::move(task));
         });
     }

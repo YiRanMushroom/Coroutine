@@ -118,10 +118,10 @@ NO_ASAN int main() {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
-            auto execution_ctx = coroutine::_details::multithreaded_execution_context{4};
+            auto execution_ctx = coroutine::_details::multithreaded_execution_context{};
 
             try {
-                execution_ctx.block_on(test_interrupt());
+                execution_ctx.async_execute(test_interrupt()).get();
             } catch (const std::exception &e) {
                 std::cout << "Caught exception: " << e.what() << std::endl;
             }
