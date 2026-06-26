@@ -121,7 +121,7 @@ NO_ASAN int main() {
             auto execution_ctx = coroutine::_details::multithreaded_execution_context{4};
 
             try {
-                execution_ctx.block_on(test_fibonacci());
+                execution_ctx.block_on(test_interrupt());
             } catch (const std::exception &e) {
                 std::cout << "Caught exception: " << e.what() << std::endl;
             }

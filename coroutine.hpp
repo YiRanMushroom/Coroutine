@@ -83,7 +83,7 @@ namespace coroutine {
             std::atomic_uint32_t m_weak_count{1};
 
         public:
-            pin_resource_base() {}
+            pin_resource_base() = default;
 
         protected:
             virtual void release_resources() noexcept = 0;
@@ -364,11 +364,11 @@ namespace coroutine {
                 }
             }
 
-            bool is_null() const noexcept {
+            [[nodiscard]] bool is_null() const noexcept {
                 return m_resource == nullptr;
             }
 
-            pin_resource_base *get_raw() const noexcept {
+            [[nodiscard]] pin_resource_base *get_raw() const noexcept {
                 return m_resource;
             }
 
@@ -423,9 +423,9 @@ namespace coroutine {
             }
         };
 
-        std::atomic_size_t g_promise_count{0};
+        inline std::atomic_size_t g_promise_count{0};
 
-        size_t debug_get_active_promise_count() noexcept {
+        inline size_t debug_get_active_promise_count() noexcept {
             return g_promise_count.load();
         }
 
@@ -654,7 +654,7 @@ namespace coroutine {
 
 
     namespace _details {
-        promise_base *future_base::get_promise_base() const noexcept {
+        inline promise_base *future_base::get_promise_base() const noexcept {
             if (m_coroutine_handle) {
                 return static_cast<promise_base *>(m_coroutine_handle.get()); // NOLINT(*-pro-type-static-cast-downcast)
             }
@@ -673,11 +673,9 @@ namespace coroutine {
         template<typename T>
         class promise : public promise_base {
         public:
-            ~promise() {
-                // std::cout << std::format("destroying promise<{}> at {:p}\n", typeid(T).name(),
-                //                          static_cast<void *>(this)) << std::endl;
-            }
+            ~promise() = default;
 
+        public:
             promise() = default;
 
         public:
@@ -739,6 +737,7 @@ namespace coroutine {
         public:
             ~promise() = default;
 
+        public:
             promise() = default;
 
         public:
@@ -795,7 +794,7 @@ namespace coroutine {
 
             using value_type = T;
 
-            ~task_base() {}
+            ~task_base() = default;
 
             task_base() = default;
 
@@ -844,7 +843,7 @@ namespace coroutine {
 
                     // std::binary_semaphore m_submitted{0};
 
-                    bool await_ready() const noexcept {
+                    [[nodiscard]] constexpr static bool await_ready() noexcept {
                         return false;
                     }
 
@@ -900,7 +899,7 @@ namespace coroutine {
                 return std::forward<Self>(self);
             }
 
-            const ref_counted_resource_handle &get_coroutine_handle() const noexcept {
+            [[nodiscard]] const ref_counted_resource_handle &get_coroutine_handle() const noexcept {
                 return this->m_coroutine_handle;
             }
 
@@ -1056,11 +1055,7 @@ namespace coroutine {
         std::unique_lock lock(mtx);
         cv.wait(lock, [&] { return finished; });
 
-        try {
-            return task.get_result();
-        } catch (...) {
-            throw;
-        }
+        return task.get_result();
     }
 
     template<typename T>
@@ -1193,7 +1188,7 @@ namespace coroutine {
                     return {};
                 }
 
-                void unhandled_exception() noexcept {
+                constexpr static void unhandled_exception() noexcept {
                     std::unreachable();
                 }
             };
@@ -1244,7 +1239,7 @@ namespace coroutine {
                     return {};
                 }
 
-                void unhandled_exception() noexcept {
+                constexpr static void unhandled_exception() noexcept {
                     std::unreachable();
                 }
             };
@@ -1304,9 +1299,9 @@ namespace coroutine {
                     tasks.get_promise()->get_execution_context())...);
 
             co_await suspend_and_then(
-                [promise](std::coroutine_handle<> h) {
+                [_promise = promise](std::coroutine_handle<> h) {
+                    auto promise = static_cast<promise_type *>(_promise);
                     auto self = promise->borrow();
-                    auto promise = static_cast<promise_type *>(self.get());
                     auto state = &promise->state;
                     execution_context *exec_ctx = promise->get_execution_context();
                     auto parent = promise->weak_borrow();
@@ -1451,9 +1446,9 @@ namespace coroutine {
             state->remaining.store(state->non_throw_tasks.size(), std::memory_order_relaxed);
 
             co_await suspend_and_then(
-                [promise](std::coroutine_handle<> h) {
+                [_promise = promise](std::coroutine_handle<> h) {
+                    auto promise = static_cast<promise_type *>(_promise);
                     auto self = promise->borrow();
-                    auto promise = static_cast<promise_type *>(self.get());
                     auto state = &promise->state;
                     execution_context *exec_ctx = promise->get_execution_context();
                     auto parent = promise->weak_borrow();
@@ -1583,7 +1578,7 @@ namespace coroutine {
                                           auto result = std::move(value);
                                           return result;
                                       },
-                                      [](std::exception_ptr &e) -> std::optional<T> {
+                                      [](const std::exception_ptr &e) -> std::optional<T> {
                                           std::rethrow_exception(e);
                                       }
                                   }, m_current_value);
@@ -1601,8 +1596,7 @@ namespace coroutine {
                 promise_base *m_promise;
 
                 void await_suspend(std::coroutine_handle<> h) const noexcept {
-                    auto moved = std::move(*m_promise).get_continuation();
-                    if (moved) {
+                    if (auto moved = std::move(*m_promise).get_continuation()) {
                         moved();
                     }
                 }
@@ -1614,7 +1608,7 @@ namespace coroutine {
                 return yield_awaiter{.m_promise = this};
             }
 
-            bool is_done() noexcept {
+            [[nodiscard]] bool is_done() const noexcept {
                 return this->get_coroutine_handle().done();
             }
 
@@ -1638,12 +1632,10 @@ namespace coroutine {
                 return static_cast<promise_type *>(base);
             }
 
-            template<typename Self> requires (std::is_rvalue_reference_v<Self &&>
-                                              && !std::is_const_v<std::remove_reference_t<Self>>
-            )
-            auto with_context(this Self &&self, execution_context *ctx) {
+            template<typename Self>
+            decltype(auto) with_context(this Self &&self, execution_context *ctx) {
                 self.get_promise()->set_execution_context(ctx);
-                return std::move(self);
+                return std::forward<Self>(self);
             }
 
             std::optional<T> await_resume() {
@@ -1659,7 +1651,7 @@ namespace coroutine {
                     generator<T> *m_generator;
                     promise_base *m_parent_promise;
 
-                    bool await_ready() const noexcept {
+                    [[nodiscard]] bool await_ready() const noexcept {
                         return m_generator->get_promise()->is_done();
                     }
 
@@ -1736,7 +1728,7 @@ namespace coroutine {
     template<typename T>
     using future = _details::task<T>;
 
-    task<void> sleep_for(std::chrono::milliseconds duration) {
+    inline task<void> sleep_for(std::chrono::milliseconds duration) {
         std::this_thread::sleep_for(duration);
         co_return;
     }
@@ -1744,13 +1736,13 @@ namespace coroutine {
     namespace _details {
         class interrupted_exception : public std::exception {
         public:
-            const char *what() const noexcept override {
+            [[nodiscard]] const char *what() const noexcept override {
                 return m_message_buffer.c_str();
             }
 
-            interrupted_exception(ref_counted_resource_handle interrupted_by) {
+            interrupted_exception(pin_resource_base* interrupted_by) {
                 m_message_buffer = std::format("Task was interrupted by coroutine with handle: {:p}",
-                                               static_cast<void *>(interrupted_by.get()));
+                                               static_cast<void *>(interrupted_by));
             }
 
         private:
@@ -1772,7 +1764,7 @@ namespace coroutine {
                 this interruptable_task<T> self,
                 COROUTINE_AWAIT_ELIDABLE_ARGUMENT
                 TaskType<void> interrupt_signal) {
-                auto handle = interrupt_signal.get_promise()->borrow();
+                auto* handle = interrupt_signal.get_promise();
                 auto [this_task, interrupt_task] = co_await any_of(std::move(self), std::move(interrupt_signal));
                 if (this_task) {
                     if (!this_task->has_value()) {
@@ -1784,12 +1776,18 @@ namespace coroutine {
                         co_return;
                     }
                 } else {
-                    throw interrupted_exception{std::move(handle)};
+                    throw interrupted_exception{static_cast<pin_resource_base*>(handle)};
                 }
             }
         };
+
+        inline task<void> wait_for_semaphore(std::shared_ptr<std::binary_semaphore> semaphore) {
+            semaphore->acquire();
+            co_return;
+        }
     }
 
     using _details::interruptable_task;
     using _details::interrupted_exception;
+    using _details::wait_for_semaphore;
 }
