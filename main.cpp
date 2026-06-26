@@ -40,42 +40,91 @@ cancelable_task<void> do_many_things(int n) {
     std::cout << n;
 }
 
-task<void> test_many_asm() {
-    co_await coroutine::any_of(
-        coroutine::any_of(coroutine::any_of(say1(), say1(), say1(), say1()), coroutine::any_of(say1(), say1())),
-        coroutine::any_of(coroutine::any_of(coroutine::any_of(say1(), say1()), say1(), say1()),
-                          coroutine::any_of(say1(), say1())));
-    co_await coroutine::any_of(coroutine::any_of(say1(),
-        coroutine::any_of(
-            say1(),
-            coroutine::any_of(say1(),
-                coroutine::any_of(say1(),
-                    coroutine::any_of(say1(),
-                        coroutine::any_of(say1(),
-                            coroutine::any_of(say1(),
-                                coroutine::any_of(say1(),
-                                    coroutine::any_of(say1(),
-                                        coroutine::any_of(say1(),
-                                            coroutine::any_of(say1(),
-                                                coroutine::any_of(say1(),
-                                                    say1()),
-                                                say1()), say1()), say1()), say1()),
-                                say1(), say1(), say1()),
-                            say1(), say1(), say1()),
-                        say1(), say1(), say1()),
-                    say1(), say1(), say1())))));
+// task<void> test_many_asm() {
+//     co_await coroutine::any_of(
+//         coroutine::any_of(coroutine::any_of(say1(), say1(), say1(), say1()), coroutine::any_of(say1(), say1())),
+//         coroutine::any_of(coroutine::any_of(coroutine::any_of(say1(), say1()), say1(), say1()),
+//                           coroutine::any_of(say1(), say1())));
+//     co_await coroutine::any_of(coroutine::any_of(say1(),
+//         coroutine::any_of(
+//             say1(),
+//             coroutine::any_of(say1(),
+//                 coroutine::any_of(say1(),
+//                     coroutine::any_of(say1(),
+//                         coroutine::any_of(say1(),
+//                             coroutine::any_of(say1(),
+//                                 coroutine::any_of(say1(),
+//                                     coroutine::any_of(say1(),
+//                                         coroutine::any_of(say1(),
+//                                             coroutine::any_of(say1(),
+//                                                 coroutine::any_of(say1(),
+//                                                     say1()),
+//                                                 say1()), say1()), say1()), say1()),
+//                                 say1(), say1(), say1()),
+//                             say1(), say1(), say1()),
+//                         say1(), say1(), say1()),
+//                     say1(), say1(), say1())))));
+//
+//     co_return;
+// }
+
+task<void> test_interrupt() {
+    co_await coroutine::sleep_for(std::chrono::milliseconds(1))
+            .into<coroutine::_details::interruptable_task>()
+            .interrupt_by(coroutine::sleep_for(std::chrono::milliseconds(1)));
+}
+
+std::generator<uint64_t> fibonacci_sequence(unsigned n) {
+    if (n == 0)
+        co_return;
+
+    if (n > 94)
+        throw std::runtime_error("Too big Fibonacci sequence. Elements would overflow.");
+
+    co_yield 0;
+
+    if (n == 1)
+        co_return;
+
+    co_yield 1;
+
+    if (n == 2)
+        co_return;
+
+    std::uint64_t a = 0;
+    std::uint64_t b = 1;
+
+    for (unsigned i = 2; i < n; ++i) {
+        std::uint64_t s = a + b;
+        co_yield s;
+        a = b;
+        b = s;
+    }
+}
+
+task<void> test_fibonacci() {
+    auto fib_gen = coroutine::asyncify(fibonacci_sequence(10));
+
+    while (auto res = co_await fib_gen) {
+        std::cout << *res << " ";
+    }
+    std::cout << std::endl;
 
     co_return;
 }
 
-int main() {
-    for (int i = 0; i < 100000; ++i) {
+NO_ASAN int main() {
+    for (int i = 0; i < 1000; ++i) {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
-            auto execution_ctx = coroutine::_details::multithreaded_execution_context{1};
+            auto execution_ctx = coroutine::_details::multithreaded_execution_context{4};
 
-            execution_ctx.block_on(test_many_asm());
+            try {
+                execution_ctx.block_on(test_fibonacci());
+            } catch (const std::exception &e) {
+                std::cout << "Caught exception: " << e.what() << std::endl;
+            }
         }
         // std::cout << std::endl;
 

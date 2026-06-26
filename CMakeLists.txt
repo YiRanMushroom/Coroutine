@@ -13,6 +13,7 @@ if(ENABLE_ASAN)
         target_link_options(asan_profile INTERFACE /fsanitize=address)
 
     else()
+        
         target_compile_options(asan_profile INTERFACE -fsanitize=address -fno-omit-frame-pointer)
         target_link_options(asan_profile INTERFACE -fsanitize=address)
     endif()
