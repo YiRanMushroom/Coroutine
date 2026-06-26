@@ -646,8 +646,11 @@ namespace coroutine {
 
         virtual void resume_promise_weak(_details::promise_base *promise) = 0;
 
-        template<template<typename> typename TaskType, typename T>
+        template<template<typename...> typename TaskType, typename T>
         NO_ASAN T block_on(TaskType<T> task);
+
+        template<template<typename...> typename TaskType, typename T>
+        std::future<T> async_execute(TaskType<T> task);
 
         virtual void wait_idle() = 0;
     };
@@ -1022,7 +1025,8 @@ namespace coroutine {
 
 
             void wait_idle() override {
-                m_thread_pool = std::make_unique<dp_thread_pool::thread_pool<>>(m_thread_count);
+                m_thread_pool->wait_for_tasks();
+                m_thread_pool->clear_tasks();
             }
 
         private:
@@ -1031,7 +1035,7 @@ namespace coroutine {
         };
     }
 
-    template<template<typename> typename TaskType, typename T>
+    template<template<typename...> typename TaskType, typename T>
     NO_ASAN T execution_context::block_on(TaskType<T> task) {
         std::condition_variable cv;
         std::mutex mtx;
@@ -1056,6 +1060,13 @@ namespace coroutine {
         cv.wait(lock, [&] { return finished; });
 
         return task.get_result();
+    }
+
+    template<template <typename...> class TaskType, typename T>
+    std::future<T> execution_context::async_execute(TaskType<T> task) {
+        return std::async(std::launch::async, [this, task = std::move(task)]() mutable {
+            return this->block_on(std::move(task));
+        });
     }
 
     template<typename T>
@@ -1740,7 +1751,7 @@ namespace coroutine {
                 return m_message_buffer.c_str();
             }
 
-            interrupted_exception(pin_resource_base* interrupted_by) {
+            interrupted_exception(pin_resource_base *interrupted_by) {
                 m_message_buffer = std::format("Task was interrupted by coroutine with handle: {:p}",
                                                static_cast<void *>(interrupted_by));
             }
@@ -1764,7 +1775,7 @@ namespace coroutine {
                 this interruptable_task<T> self,
                 COROUTINE_AWAIT_ELIDABLE_ARGUMENT
                 TaskType<void> interrupt_signal) {
-                auto* handle = interrupt_signal.get_promise();
+                auto *handle = interrupt_signal.get_promise();
                 auto [this_task, interrupt_task] = co_await any_of(std::move(self), std::move(interrupt_signal));
                 if (this_task) {
                     if (!this_task->has_value()) {
@@ -1776,7 +1787,7 @@ namespace coroutine {
                         co_return;
                     }
                 } else {
-                    throw interrupted_exception{static_cast<pin_resource_base*>(handle)};
+                    throw interrupted_exception{static_cast<pin_resource_base *>(handle)};
                 }
             }
         };
