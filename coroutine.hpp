@@ -1078,14 +1078,10 @@ namespace coroutine {
 
     template<template<typename...> typename TaskType, typename T>
     NO_ASAN T execution_context::block_on(TaskType<T> task) {
-        std::condition_variable cv;
-        std::mutex mtx;
-        bool finished = false;
+        std::binary_semaphore semaphore{0};
 
         std::function<void()> continuation = [&] {
-            std::lock_guard lock(mtx);
-            finished = true;
-            cv.notify_one();
+            semaphore.release();
         };
 
         auto *promise = task.get_promise();
@@ -1097,10 +1093,8 @@ namespace coroutine {
 
         resume_promise_weak(promise);
 
+        semaphore.acquire();
         this->wait_idle();
-
-        std::unique_lock lock(mtx);
-        cv.wait(lock, [&] { return finished; });
 
         return task.get_result();
     }
