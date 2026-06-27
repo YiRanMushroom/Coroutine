@@ -31,11 +31,13 @@ cancelable_task<void> do_many_things(int n) {
         co_return;
     }
 
-    co_await do_many_things(n - 1), co_await do_many_things(n - 2);
+    co_await coroutine::any_of(do_many_things(n - 3), do_many_things(n - 2),
+                               coroutine::any_of(do_many_things(n - 4), do_many_things(n - 3)));
+
+    // co_await do_many_things(n - 1), co_await do_many_things(n - 2);
 
     co_await coroutine::all_of(do_many_things(n - 3), do_many_things(n - 4));
 
-    // co_await coroutine::all_of(do_many_things(n - 2), do_many_things(n - 3));
 
     std::cout << n;
 }
@@ -85,15 +87,39 @@ task<void> test_fibonacci() {
     co_return;
 }
 
+task<void> test_any_simple() {
+    auto [task1, task2] = co_await coroutine::any_of(
+        coroutine::sleep_for(std::chrono::milliseconds(10)),
+        coroutine::sleep_for(std::chrono::milliseconds(20)));
+
+    if (task1) {
+        std::cout << "Task 1 completed first." << std::endl;
+    } else if (task2) {
+        std::cout << "Task 2 completed first." << std::endl;
+    } else {
+        std::cout << "No task completed." << std::endl;
+    }
+}
+
+task<void> test_any_of() {
+    co_await coroutine::any_of(
+        coroutine::sleep_for(std::chrono::milliseconds(10)),
+        coroutine::sleep_for(std::chrono::milliseconds(20)),
+        coroutine::sleep_for(std::chrono::milliseconds(30)), coroutine::sleep_for(std::chrono::milliseconds(30)),
+        coroutine::sleep_for(std::chrono::milliseconds(30)), coroutine::sleep_for(std::chrono::milliseconds(30)),
+        coroutine::sleep_for(std::chrono::milliseconds(30)), coroutine::sleep_for(std::chrono::milliseconds(30)),
+        coroutine::sleep_for(std::chrono::milliseconds(30)));
+}
+
 NO_ASAN int main() {
-    for (int i = 0; i < 1000; ++i) {
+    for (int i = 0; i < 1; ++i) {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
-            auto execution_ctx = coroutine::_details::multithreaded_execution_context{};
+            auto execution_ctx = coroutine::_details::multithreaded_execution_context{4};
 
             try {
-                execution_ctx.async_execute(test_interrupt()).get();
+                execution_ctx.async_execute(test_any_of()).get();
             } catch (const std::exception &e) {
                 std::cout << "Caught exception: " << e.what() << std::endl;
             }
@@ -101,7 +127,11 @@ NO_ASAN int main() {
         // std::cout << std::endl;
 
 
+        std::cout << std::endl;
         std::cout << coroutine::_details::debug_get_active_promise_count();
+
+        std::cout << std::endl;
+        std::cout << coroutine::execution_context::resumed_promise_count.load(std::memory_order_acquire) << std::endl;
     }
 
     std::cout << "Heap allocations: " << std::endl;

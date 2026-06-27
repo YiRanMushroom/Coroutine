@@ -280,8 +280,7 @@ namespace coroutine {
             }
 
             void reset() noexcept {
-                if (m_resource) {
-                    auto *resource = std::exchange(m_resource, nullptr);
+                if (auto *resource = std::exchange(m_resource, nullptr)) {
                     // this must be done before releasing the strong reference to avoid potential use-after-free issues
                     resource->release_strong_reference();
                 }
@@ -547,8 +546,7 @@ namespace coroutine {
         protected:
             void finalize_finished_promise() {
                 this->unpin();
-                auto moved = std::move(*this).get_continuation();
-                if (moved) {
+                if (auto moved = std::move(*this).get_continuation()) {
                     moved();
                 }
             }
@@ -676,6 +674,9 @@ namespace coroutine {
         virtual void unlock() = 0;
 
         virtual void wait_idle() = 0;
+
+    public:
+        inline static std::atomic_size_t resumed_promise_count = 0;
     };
 
 
@@ -1033,6 +1034,9 @@ namespace coroutine {
                     if (!locked) {
                         return;
                     }
+
+                    resumed_promise_count.fetch_add(1, std::memory_order_relaxed);
+
                     auto *promise = static_cast<promise_base *>(locked.get());
                     const std::coroutine_handle<> handle = promise->get_coroutine_handle();
 
@@ -1448,10 +1452,15 @@ namespace coroutine {
                             if (task_promise->get_execution_context() == nullptr) {
                                 task_promise->set_execution_context(exec_ctx);
                             }
-                            task_promise->set_continuation([parent, state]() mutable {
+                            task_promise->set_continuation([parent]() mutable {
                                 auto weak_parent = std::move(parent);
+                                state_type *state = &static_cast<promise_type *>(weak_parent.get_raw())->state;
+
+                                // we have to do this, we must move the task even if parent is already finished, otherwise we will get a memory leak
                                 auto this_task = std::move(std::get<idx>(state->non_throw_tasks));
+
                                 auto locked_parent = weak_parent.lock();
+
                                 if (!locked_parent) {
                                     return;
                                 }
@@ -1598,9 +1607,13 @@ namespace coroutine {
                         if (task_promise->get_execution_context() == nullptr) {
                             task_promise->set_execution_context(exec_ctx);
                         }
-                        task_promise->set_continuation([parent, state, idx]() mutable {
+                        task_promise->set_continuation([parent, idx]() mutable {
                             auto weak_parent = std::move(parent);
+                            state_type *state = &static_cast<promise_type *>(weak_parent.get_raw())->state;
+
+                            // we have to do this, we must move the task even if parent is already finished, otherwise we will get a memory leak
                             auto this_task = std::move(state->non_throw_tasks[idx]);
+
                             auto locked_parent = weak_parent.lock();
                             if (!locked_parent) {
                                 return;
@@ -1761,8 +1774,9 @@ namespace coroutine {
         template<template<typename> typename TaskType = task, typename Fn>
         auto asyncify_function(Fn fn) {
             return [fn = std::move(fn)]<typename... Args>(
-                Args &&... args) mutable -> TaskType<std::invoke_result_t<Fn, Args...>> {
-                co_return co_await fn(std::forward<Args>(args)...);
+                this auto self,
+                Args &&... args) -> TaskType<std::invoke_result_t<Fn, Args...>> {
+                co_return co_await self.fn(std::forward<Args>(args)...);
             };
         }
 
@@ -1784,7 +1798,6 @@ namespace coroutine {
 
     template<typename T>
     using future = _details::task<T>;
-
 
     namespace _details {
         class interrupted_exception : public std::exception {
@@ -1828,9 +1841,24 @@ namespace coroutine {
                     } else {
                         co_return;
                     }
-                } else {
-                    throw interrupted_exception{static_cast<pin_resource_base *>(handle)};
                 }
+
+                throw interrupted_exception{static_cast<pin_resource_base *>(handle)};
+            }
+
+            template<typename TaskType>
+            task<std::optional<std::expected<T, std::exception_ptr>>> interrupt_by_nothrow(
+                COROUTINE_AWAIT_ELIDABLE_ARGUMENT
+                this interruptable_task<T> self,
+                COROUTINE_AWAIT_ELIDABLE_ARGUMENT
+                TaskType interrupt_signal) {
+                auto *handle = interrupt_signal.get_promise();
+                auto [this_task, interrupt_task] = co_await any_of(std::move(self), std::move(interrupt_signal));
+                if (this_task) {
+                    co_return std::move(this_task);
+                }
+
+                co_return std::nullopt;
             }
         };
 
