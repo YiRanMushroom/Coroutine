@@ -40,37 +40,9 @@ cancelable_task<void> do_many_things(int n) {
     std::cout << n;
 }
 
-// task<void> test_many_asm() {
-//     co_await coroutine::any_of(
-//         coroutine::any_of(coroutine::any_of(say1(), say1(), say1(), say1()), coroutine::any_of(say1(), say1())),
-//         coroutine::any_of(coroutine::any_of(coroutine::any_of(say1(), say1()), say1(), say1()),
-//                           coroutine::any_of(say1(), say1())));
-//     co_await coroutine::any_of(coroutine::any_of(say1(),
-//         coroutine::any_of(
-//             say1(),
-//             coroutine::any_of(say1(),
-//                 coroutine::any_of(say1(),
-//                     coroutine::any_of(say1(),
-//                         coroutine::any_of(say1(),
-//                             coroutine::any_of(say1(),
-//                                 coroutine::any_of(say1(),
-//                                     coroutine::any_of(say1(),
-//                                         coroutine::any_of(say1(),
-//                                             coroutine::any_of(say1(),
-//                                                 coroutine::any_of(say1(),
-//                                                     say1()),
-//                                                 say1()), say1()), say1()), say1()),
-//                                 say1(), say1(), say1()),
-//                             say1(), say1(), say1()),
-//                         say1(), say1(), say1()),
-//                     say1(), say1(), say1())))));
-//
-//     co_return;
-// }
-
 task<void> test_interrupt() {
     co_await coroutine::sleep_for(std::chrono::milliseconds(1))
-            .into<coroutine::_details::interruptable_task>()
+            .into<coroutine::interruptable_task>()
             .interrupt_by(coroutine::sleep_for(std::chrono::milliseconds(1)));
 }
 

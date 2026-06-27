@@ -28,6 +28,7 @@
 
 #include <shared_mutex>
 
+#include "coroutine.hpp"
 #include "thread_pool/thread_pool.h"
 
 #define DO_HALO 1
@@ -557,6 +558,12 @@ namespace coroutine {
                 finalize_finished_promise();
             }
 
+        public:
+            enum task_hint : uint32_t {
+                e_none = 0,
+                e_io = 1 << 0,
+            };
+
         protected:
             std::function<void()> m_continuation;
             ref_counted_resource_handle m_pinned_self;
@@ -564,10 +571,20 @@ namespace coroutine {
             ref_counted_resource_weak_handle m_parent_handle{};
             std::coroutine_handle<> m_coroutine_handle;
             std::atomic<int> m_in_continuation_access{0};
+            task_hint m_task_hint{e_none};
             std::atomic_bool m_finalized{false};
+
             bool cancelable = false;
 
         public:
+            inline task_hint get_task_hint() const noexcept {
+                return m_task_hint;
+            }
+
+            void set_task_hint(task_hint hint) noexcept {
+                m_task_hint = hint;
+            }
+
             inline bool should_try_finalize() noexcept {
                 return m_finalized.exchange(true, std::memory_order_acq_rel) == false;
             }
@@ -1000,13 +1017,17 @@ namespace coroutine {
 
         class multithreaded_execution_context : public execution_context {
         public:
-            explicit multithreaded_execution_context(uint32_t thread_count = std::jthread::hardware_concurrency() * 2)
-                : m_thread_pool(std::make_unique<dp_thread_pool::thread_pool<>>(thread_count)) {}
+            explicit multithreaded_execution_context(uint32_t thread_count = std::jthread::hardware_concurrency())
+                : m_thread_pool(std::make_unique<dp_thread_pool::thread_pool<>>(thread_count)),
+                  m_io_thread_pool(
+                      std::make_unique<dp_thread_pool::thread_pool<>>(
+                          std::max(4u, 2 * std::jthread::hardware_concurrency()))) {}
 
 
-            void resume_promise_weak(_details::promise_base *promise) override {
+            void resume_promise_weak(promise_base *promise) override {
                 auto weak_handle = promise->weak_borrow();
-                m_thread_pool->enqueue_detach([_weak_handle = std::move(weak_handle)] mutable {
+
+                auto task = [_weak_handle = std::move(weak_handle)] mutable {
                     auto weak_handle = std::move(_weak_handle);
                     auto locked = weak_handle.lock();
                     if (!locked) {
@@ -1020,10 +1041,14 @@ namespace coroutine {
                     } else {
                         __debugbreak();
                     }
+                };
 
-                    // if (handle.done() && promise->should_try_finalize()) {
-                    // }
-                });
+                if (promise->get_task_hint() & promise_base::e_io) {
+                    m_io_thread_pool->enqueue_detach(std::move(task));
+                    return;
+                }
+
+                m_thread_pool->enqueue_detach(std::move(task));
             }
 
             ~multithreaded_execution_context() override {
@@ -1044,10 +1069,9 @@ namespace coroutine {
                 m_lock.unlock_shared();
             }
 
-
         private:
             std::unique_ptr<dp_thread_pool::thread_pool<>> m_thread_pool;
-
+            std::unique_ptr<dp_thread_pool::thread_pool<>> m_io_thread_pool;
             std::shared_mutex m_lock;
         };
     }
@@ -1068,6 +1092,8 @@ namespace coroutine {
         assert(promise);
         promise->set_continuation(continuation);
         promise->set_execution_context(this);
+
+        promise->set_task_hint(_details::promise_base::e_none);
 
         resume_promise_weak(promise);
 
@@ -1765,10 +1791,6 @@ namespace coroutine {
     template<typename T>
     using future = _details::task<T>;
 
-    inline task<void> sleep_for(std::chrono::milliseconds duration) {
-        std::this_thread::sleep_for(duration);
-        co_return;
-    }
 
     namespace _details {
         class interrupted_exception : public std::exception {
@@ -1818,8 +1840,26 @@ namespace coroutine {
             }
         };
 
-        inline task<void> wait_for_semaphore(std::shared_ptr<std::binary_semaphore> semaphore) {
+        template<typename T>
+        class COROUTINE_AWAIT_ELIDABLE io_task : public task_base<T> {
+        public:
+            io_task(ref_counted_resource_handle &&coroutine_handle) noexcept : task_base<T>(
+                std::move(coroutine_handle)) {
+                this->get_promise()->set_task_hint(
+                    static_cast<promise_base::task_hint>(
+                        this->get_promise()->get_task_hint() | promise_base::task_hint::e_io));
+            }
+
+            io_task() = default;
+        };
+
+        inline io_task<void> wait_for_semaphore(std::shared_ptr<std::binary_semaphore> semaphore) {
             semaphore->acquire();
+            co_return;
+        }
+
+        inline io_task<void> sleep_for(std::chrono::milliseconds duration) {
+            std::this_thread::sleep_for(duration);
             co_return;
         }
     }
@@ -1827,4 +1867,5 @@ namespace coroutine {
     using _details::interruptable_task;
     using _details::interrupted_exception;
     using _details::wait_for_semaphore;
+    using _details::sleep_for;
 }
