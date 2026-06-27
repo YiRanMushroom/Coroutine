@@ -474,7 +474,7 @@ namespace coroutine {
                 return std::forward<T>(value);
             }
 
-            std::function<void()> get_continuation() && noexcept {
+            std::move_only_function<void()> get_continuation() && noexcept {
                 // std::lock_guard<std::mutex> lock(m_continuation_protector);
                 if (m_in_continuation_access.fetch_add(1) != 0) {
                     __debugbreak();
@@ -485,7 +485,7 @@ namespace coroutine {
             }
 
         public:
-            inline void set_continuation(std::function<void()> continuation) {
+            inline void set_continuation(std::move_only_function<void()> continuation) {
                 // std::lock_guard<std::mutex> lock(m_continuation_protector);
                 if (m_in_continuation_access.fetch_add(1) != 0) {
                     __debugbreak();
@@ -563,7 +563,7 @@ namespace coroutine {
             };
 
         protected:
-            std::function<void()> m_continuation;
+            std::move_only_function<void()> m_continuation;
             ref_counted_resource_handle m_pinned_self;
             execution_context *m_execution_context = nullptr;
             ref_counted_resource_weak_handle m_parent_handle{};
@@ -1084,13 +1084,13 @@ namespace coroutine {
     NO_ASAN T execution_context::block_on(TaskType<T> task) {
         std::binary_semaphore semaphore{0};
 
-        std::function<void()> continuation = [&] {
+        std::move_only_function<void()> continuation = [&] {
             semaphore.release();
         };
 
         auto *promise = task.get_promise();
         assert(promise);
-        promise->set_continuation(continuation);
+        promise->set_continuation(std::move(continuation));
         promise->set_execution_context(this);
 
         promise->set_task_hint(_details::promise_base::e_none);
@@ -1249,9 +1249,9 @@ namespace coroutine {
                     return {};
                 }
 
-                constexpr static void unhandled_exception() noexcept {
-                    std::unreachable();
-                }
+                // constexpr static void unhandled_exception() noexcept {
+                //     std::unreachable();
+                // }
             };
 
             std::coroutine_handle<> handle;
