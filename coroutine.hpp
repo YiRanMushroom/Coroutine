@@ -1080,6 +1080,10 @@ namespace coroutine {
                     auto *promise = static_cast<promise_base *>(locked.get());
                     const std::coroutine_handle<> handle = promise->get_coroutine_handle();
 
+                    if (!promise->is_cancelable()) {
+                        promise->pin();
+                    }
+
                     if (handle && !handle.done()) {
                         handle.resume();
                     } else {
