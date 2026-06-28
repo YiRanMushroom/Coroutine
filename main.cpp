@@ -127,9 +127,9 @@ cancelable_task<void> test_cancel_task() {
 }
 
 task<void> test_future() {
-    co_await std::async([] {
+    co_await coroutine::from_future(std::async([] {
         std::cout << "Hello from std::async!" << std::endl;
-    });
+    }));
 
     std::cout << "Now testing coroutine future..." << std::endl;
 }

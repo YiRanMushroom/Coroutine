@@ -1920,8 +1920,8 @@ namespace coroutine {
         template<typename T>
         class COROUTINE_AWAIT_ELIDABLE io_task;
 
-        template<typename T>
-        io_task<T> asyncify(std::future<T> future) {
+        template<template<typename> typename TaskType = io_task, typename T>
+        TaskType<T> from_future(std::future<T> future) {
             co_return future.get();
         }
     }
@@ -1931,6 +1931,7 @@ namespace coroutine {
     using _details::any_of;
     using _details::generator;
     using _details::asyncify;
+    using _details::from_future;
     using _details::asyncify_function;
     using _details::get_current_coroutine_context;
     using _details::get_current_promise_base;
@@ -2031,15 +2032,15 @@ namespace coroutine {
     using _details::wait_for_semaphore;
     using _details::sleep_for;
 
-    namespace _details {
-        template<typename T>
-        struct promise_base_transformer<std::future<T>> {
-            constexpr static bool need_forwarding = true;
-
-            template<typename U>
-            static io_task<T> do_transform(U future) {
-                return asyncify(std::move(future));
-            }
-        };
-    }
+    // namespace _details {
+    //     template<typename T>
+    //     struct promise_base_transformer<std::future<T>> {
+    //         constexpr static bool need_forwarding = true;
+    //
+    //         template<typename U>
+    //         static io_task<T> do_transform(U future) {
+    //             return asyncify(std::move(future));
+    //         }
+    //     };
+    // }
 }
