@@ -1675,6 +1675,8 @@ namespace coroutine {
                     }
                 });
 
+            state->non_throw_tasks.clear();
+
             co_return std::move(state->result);
         }
 
