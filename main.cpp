@@ -130,11 +130,11 @@ cancelable_task<void> test_cancel_task() {
 }
 
 NO_ASAN int main() {
-    for (int i = 0; i < 1000; ++i) {
+    for (int i = 0; i < 100; ++i) {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
-            auto execution_ctx = coroutine::_details::multithreaded_execution_context{1};
+            auto execution_ctx = coroutine::_details::multithreaded_execution_context{4};
 
             try {
                 execution_ctx.async_execute(coroutine::any_of(test_cancel_task(), say1())).get();

@@ -495,7 +495,7 @@ namespace coroutine {
                 return std::forward<T>(value);
             }
 
-            std::move_only_function<void()> get_continuation() && noexcept {
+            std::move_only_function<void(promise_base *)> get_continuation() && noexcept {
                 // std::lock_guard<std::mutex> lock(m_continuation_protector);
                 if (m_in_continuation_access.fetch_add(1) != 0) {
                     __debugbreak();
@@ -506,7 +506,7 @@ namespace coroutine {
             }
 
         public:
-            inline void set_continuation(std::move_only_function<void()> continuation) {
+            inline void set_continuation(std::move_only_function<void(promise_base *)> continuation) {
                 // std::lock_guard<std::mutex> lock(m_continuation_protector);
                 if (m_in_continuation_access.fetch_add(1) != 0) {
                     __debugbreak();
@@ -572,7 +572,7 @@ namespace coroutine {
             void finalize_finished_promise() {
                 this->unpin();
                 if (auto moved = std::move(*this).get_continuation()) {
-                    moved();
+                    moved(this);
                 }
             }
 
@@ -588,7 +588,7 @@ namespace coroutine {
             };
 
         protected:
-            std::move_only_function<void()> m_continuation;
+            std::move_only_function<void(promise_base *)> m_continuation;
             ref_counted_resource_handle m_pinned_self;
             execution_context *m_execution_context = nullptr;
             ref_counted_resource_weak_handle m_parent_handle{};
@@ -929,7 +929,7 @@ namespace coroutine {
 
                         auto *local_ctx = promise->get_execution_context();
 
-                        promise->set_continuation([weak_parent = std::move(weak_parent)]() mutable {
+                        promise->set_continuation([weak_parent = std::move(weak_parent)](promise_base *) mutable {
                             auto parent = weak_parent.lock();
                             if (!parent) {
                                 return;
@@ -1062,7 +1062,7 @@ namespace coroutine {
                 : m_thread_pool(std::make_unique<dp_thread_pool::thread_pool<>>(thread_count)),
                   m_io_thread_pool(
                       std::make_unique<dp_thread_pool::thread_pool<>>(
-                          std::max(4u, 2 * std::jthread::hardware_concurrency()))) {}
+                          std::max({4u, 2 * std::jthread::hardware_concurrency(), 2 * thread_count}))) {}
 
 
             void resume_promise_weak(promise_base *promise) override {
@@ -1128,7 +1128,7 @@ namespace coroutine {
     NO_ASAN T execution_context::block_on(TaskType<T, Args...> task) {
         std::binary_semaphore semaphore{0};
 
-        std::move_only_function<void()> continuation = [&] {
+        std::move_only_function<void(_details::promise_base *)> continuation = [&](_details::promise_base *) {
             semaphore.release();
         };
 
@@ -1418,7 +1418,7 @@ namespace coroutine {
                             if (task_promise->get_execution_context() == nullptr) {
                                 task_promise->set_execution_context(exec_ctx);
                             }
-                            task_promise->set_continuation([_parent = parent] mutable {
+                            task_promise->set_continuation([_parent = parent](promise_base *) mutable {
                                 auto parent = std::move(_parent);
                                 auto locked_parent = parent.lock();
                                 if (!locked_parent) {
@@ -1492,12 +1492,12 @@ namespace coroutine {
                             if (task_promise->get_execution_context() == nullptr) {
                                 task_promise->set_execution_context(exec_ctx);
                             }
-                            task_promise->set_continuation([parent]() mutable {
+                            task_promise->set_continuation([parent, task_promise](promise_base *) mutable {
                                 auto weak_parent = std::move(parent);
                                 state_type *state = &static_cast<promise_type *>(weak_parent.get_raw())->state;
 
-                                // we have to do this, we must move the task even if parent is already finished, otherwise we will get a memory leak
-                                auto this_task = std::move(std::get<idx>(state->non_throw_tasks));
+                                // // we have to do this, we must move the task even if parent is already finished, otherwise we will get a memory leak
+                                // auto this_task = std::move(std::get<idx>(state->non_throw_tasks));
 
                                 auto locked_parent = weak_parent.lock();
 
@@ -1508,8 +1508,9 @@ namespace coroutine {
                                 auto *parent_promise = static_cast<promise_type *>(locked_parent.get());
 
                                 if (!state->finished.exchange(true, std::memory_order_acq_rel)) {
-                                    std::get<idx>(parent_promise->state.result) = this_task.get_promise()->
-                                            get_result_move();
+                                    std::get<idx>(parent_promise->state.result) =
+                                            static_cast<decltype(std::get<idx>(parent_promise->state.non_throw_tasks).
+                                                get_promise())>(task_promise)->get_result_move();
                                     parent_promise->get_execution_context()->resume_promise_weak(parent_promise);
                                 }
                             });
@@ -1572,7 +1573,7 @@ namespace coroutine {
                         if (task_promise->get_execution_context() == nullptr) {
                             task_promise->set_execution_context(exec_ctx);
                         }
-                        task_promise->set_continuation([_parent = parent] mutable {
+                        task_promise->set_continuation([_parent = parent](promise_base *) mutable {
                             auto parent = std::move(_parent);
                             auto locked_parent = parent.lock();
                             if (!locked_parent) {
@@ -1649,12 +1650,12 @@ namespace coroutine {
                         if (task_promise->get_execution_context() == nullptr) {
                             task_promise->set_execution_context(exec_ctx);
                         }
-                        task_promise->set_continuation([parent, idx]() mutable {
+                        task_promise->set_continuation([parent, idx](promise_base *task_promise) mutable {
                             auto weak_parent = std::move(parent);
                             state_type *state = &static_cast<promise_type *>(weak_parent.get_raw())->state;
 
                             // we have to do this, we must move the task even if parent is already finished, otherwise we will get a memory leak
-                            auto this_task = std::move(state->non_throw_tasks[idx]);
+                            // auto this_task = std::move(state->non_throw_tasks[idx]);
 
                             auto locked_parent = weak_parent.lock();
                             if (!locked_parent) {
@@ -1664,7 +1665,8 @@ namespace coroutine {
                             auto *parent_promise = static_cast<promise_type *>(locked_parent.get());
 
                             if (!state->finished.exchange(true, std::memory_order_acq_rel)) {
-                                parent_promise->state.result[idx] = this_task.get_promise()->get_result_move();
+                                parent_promise->state.result[idx] = static_cast<decltype(parent_promise->state.
+                                    non_throw_tasks[idx].get_promise())>(task_promise)->get_result_move();
                                 parent_promise->get_execution_context()->resume_promise_weak(parent_promise);
                             }
                         });
@@ -1711,7 +1713,7 @@ namespace coroutine {
 
                 void await_suspend(std::coroutine_handle<> h) const noexcept {
                     if (auto moved = std::move(*m_promise).get_continuation()) {
-                        moved();
+                        moved(m_promise);
                     }
                 }
             };
@@ -1784,7 +1786,7 @@ namespace coroutine {
 
                         auto *local_ctx = promise->get_execution_context();
 
-                        promise->set_continuation([weak_parent = std::move(weak_parent)]() mutable {
+                        promise->set_continuation([weak_parent = std::move(weak_parent)](promise_base *) mutable {
                             auto parent = weak_parent.lock();
                             if (!parent) {
                                 return;
