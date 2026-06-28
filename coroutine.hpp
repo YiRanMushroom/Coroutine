@@ -605,6 +605,7 @@ namespace coroutine {
             std::atomic_bool m_should_be_cancelled{false};
 
             bool cancelable = false;
+            bool original_cancelable = false;
 
         public:
             inline task_hint get_task_hint() const noexcept {
@@ -624,7 +625,16 @@ namespace coroutine {
             }
 
             inline void set_cancelable(bool value) noexcept {
+                original_cancelable = value;
                 cancelable = value;
+            }
+
+            inline void set_cancelable_temporary(bool value) noexcept {
+                cancelable = value;
+            }
+
+            void reset_cancelable() noexcept {
+                cancelable = original_cancelable;
             }
 
             void set_parent(ref_counted_resource_weak_handle parent) noexcept {
@@ -930,7 +940,8 @@ namespace coroutine {
                 }
 
                 promise_base *promise = this->get_promise();
-                promise->set_cancelable(promise->is_cancelable() && parent_promise->is_cancelable());
+                promise->reset_cancelable();
+                promise->set_cancelable_temporary(promise->is_cancelable() && parent_promise->is_cancelable());
 
                 struct awaiter {
                     task_base<T> *m_task;
