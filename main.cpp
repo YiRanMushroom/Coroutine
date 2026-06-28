@@ -101,7 +101,9 @@ task<void> test_any_simple() {
     }
 }
 
-task<void> test_any_of() {
+cancelable_task<void> test_any_of() {
+    co_await coroutine::sleep_for(std::chrono::milliseconds(100));
+
     co_await coroutine::any_of(
         coroutine::sleep_for(std::chrono::milliseconds(10)),
         coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(20)),
@@ -111,15 +113,31 @@ task<void> test_any_of() {
         coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(30))))))));
 }
 
+cancelable_task<void> test_cancel_task() {
+    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
+    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
+    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
+    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
+    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
+    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
+    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
+    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
+    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
+
+    auto promise = co_await coroutine::_details::get_current_promise_base();
+
+    std::cout << "This should not be printed" << std::endl;
+}
+
 NO_ASAN int main() {
-    for (int i = 0; i < 1; ++i) {
+    for (int i = 0; i < 1000; ++i) {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
-            auto execution_ctx = coroutine::_details::multithreaded_execution_context{2};
+            auto execution_ctx = coroutine::_details::multithreaded_execution_context{};
 
             try {
-                execution_ctx.async_execute(test_any_of()).get();
+                execution_ctx.async_execute(coroutine::any_of(test_cancel_task(), say1())).get();
             } catch (const std::exception &e) {
                 std::cout << "Caught exception: " << e.what() << std::endl;
             }

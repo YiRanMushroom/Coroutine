@@ -378,6 +378,13 @@ namespace coroutine {
             pin_resource_base *m_resource = nullptr;
         };
 
+        class cancelled_exception : public std::exception {
+        public:
+            const char *what() const noexcept override {
+                return "Coroutine was cancelled.";
+            }
+        };
+
         class promise_base;
 
         class future_base {
@@ -464,13 +471,27 @@ namespace coroutine {
 
             promise_base &operator=(promise_base &&) = delete;
 
+        protected:
+            void throw_if_cancelled() const {
+                if (m_should_be_cancelled) {
+                    throw cancelled_exception();
+                }
+            }
+
+        public:
+            void cancel() {
+                m_should_be_cancelled = true;
+            }
+
             template<is_awaitable Awaitable>
             decltype(auto) await_transform(Awaitable &&awaitable) {
+                throw_if_cancelled();
                 return std::forward<Awaitable>(awaitable).by_promise(this);
             }
 
             template<typename T> requires (!is_awaitable<T>)
             decltype(auto) await_transform(T &&value) {
+                throw_if_cancelled();
                 return std::forward<T>(value);
             }
 
@@ -521,6 +542,10 @@ namespace coroutine {
 
         protected:
             void release_resources() noexcept override {
+                m_should_be_cancelled = true;
+                if (m_coroutine_handle && !m_coroutine_handle.done()) {
+                    m_coroutine_handle.resume();
+                }
                 auto weak_self = weak_borrow();
                 m_pinned_self.reset();
             }
@@ -571,6 +596,7 @@ namespace coroutine {
             std::atomic<int> m_in_continuation_access{0};
             task_hint m_task_hint{e_none};
             std::atomic_bool m_finalized{false};
+            std::atomic_bool m_should_be_cancelled{false};
 
             bool cancelable = false;
 
@@ -663,11 +689,11 @@ namespace coroutine {
 
         virtual void resume_promise_weak(_details::promise_base *promise) = 0;
 
-        template<template<typename...> typename TaskType, typename T>
-        NO_ASAN T block_on(TaskType<T> task);
+        template<template<typename...> typename TaskType, typename T, typename... Args>
+        NO_ASAN T block_on(TaskType<T, Args...> task);
 
-        template<template<typename...> typename TaskType, typename T>
-        std::future<T> async_execute(TaskType<T> task);
+        template<template <typename...> class TaskType, typename T, typename... Args>
+        std::future<T> async_execute(TaskType<T, Args...> task);
 
         virtual void lock() = 0;
 
@@ -709,6 +735,10 @@ namespace coroutine {
             using value_type = T;
 
             T get_result_copy() const {
+                if (m_should_be_cancelled) {
+                    throw cancelled_exception();
+                }
+
                 // std::lock_guard lock(m_result_mutex);
                 return std::visit(overloaded{
                                       [](const not_finished &) -> T {
@@ -724,6 +754,10 @@ namespace coroutine {
             }
 
             T get_result_move() {
+                if (m_should_be_cancelled) {
+                    throw cancelled_exception();
+                }
+
                 // std::lock_guard lock(m_result_mutex);
                 return std::visit(overloaded{
                                       [](const not_finished &) -> T {
@@ -771,6 +805,9 @@ namespace coroutine {
             using value_type = void;
 
             void get_result_copy() const {
+                if (m_should_be_cancelled) {
+                    throw cancelled_exception();
+                }
                 // std::lock_guard lock(m_result_mutex);
                 return std::visit(overloaded{
                                       [](const not_finished &) -> void {
@@ -786,6 +823,9 @@ namespace coroutine {
             }
 
             void get_result_move() {
+                if (m_should_be_cancelled) {
+                    throw cancelled_exception();
+                }
                 // std::lock_guard lock(m_result_mutex);
                 return get_result_copy();
             }
@@ -1080,8 +1120,8 @@ namespace coroutine {
         };
     }
 
-    template<template<typename...> typename TaskType, typename T>
-    NO_ASAN T execution_context::block_on(TaskType<T> task) {
+    template<template<typename...> typename TaskType, typename T, typename... Args>
+    NO_ASAN T execution_context::block_on(TaskType<T, Args...> task) {
         std::binary_semaphore semaphore{0};
 
         std::move_only_function<void()> continuation = [&] {
@@ -1103,8 +1143,8 @@ namespace coroutine {
         return task.get_result();
     }
 
-    template<template <typename...> class TaskType, typename T>
-    std::future<T> execution_context::async_execute(TaskType<T> task) {
+    template<template <typename...> class TaskType, typename T, typename... Args>
+    std::future<T> execution_context::async_execute(TaskType<T, Args...> task) {
         this->lock();
         return std::async(std::launch::async, [this, task = std::move(task)]() mutable {
             struct unlock_guard {
@@ -1248,10 +1288,6 @@ namespace coroutine {
                 constexpr static std::suspend_never final_suspend() noexcept {
                     return {};
                 }
-
-                // constexpr static void unhandled_exception() noexcept {
-                //     std::unreachable();
-                // }
             };
 
             std::coroutine_handle<> handle;
@@ -1480,6 +1516,8 @@ namespace coroutine {
                         exec_ctx->resume_promise_weak(task_promise);
                     }
                 });
+
+            state->non_throw_tasks = {};
 
             co_return std::move(state->result);
         }
