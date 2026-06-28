@@ -121,7 +121,7 @@ cancelable_task<void> test_cancel_task() {
 }
 
 NO_ASAN int main() {
-    for (int i = 0; i < 1; ++i) {
+    for (int i = 0; i < 1000; ++i) {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 

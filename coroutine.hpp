@@ -450,10 +450,10 @@ namespace coroutine {
 
                 // __debugbreak();
 
-                if (m_pinned_self) {
-                    debug_print("Error: promise_base at {:p} is being destroyed while still pinned.",
-                                static_cast<void *>(this));
-                }
+                // if (m_pinned_self) {
+                //     debug_print("Error: promise_base at {:p} is being destroyed while still pinned.",
+                //                 static_cast<void *>(this));
+                // }
 
                 g_promise_count.fetch_sub(1);
             }
@@ -595,7 +595,7 @@ namespace coroutine {
 
         protected:
             std::move_only_function<void(promise_base *)> m_continuation;
-            ref_counted_resource_handle m_pinned_self;
+            // ref_counted_resource_handle m_pinned_self;
             execution_context *m_execution_context = nullptr;
             ref_counted_resource_weak_handle m_parent_handle{};
             std::coroutine_handle<> m_coroutine_handle;
@@ -929,6 +929,9 @@ namespace coroutine {
                     throw std::runtime_error("No coroutine associated with this task.");
                 }
 
+                promise_base *promise = this->get_promise();
+                promise->set_cancelable(promise->is_cancelable() && parent_promise->is_cancelable());
+
                 struct awaiter {
                     task_base<T> *m_task;
                     promise_base *m_parent_promise;
@@ -953,7 +956,6 @@ namespace coroutine {
                         promise->set_parent(weak_parent);
 
                         auto *local_ctx = promise->get_execution_context();
-
 
                         if (m_parent_promise->is_cancelable()) {
                             promise->set_continuation([weak_parent = std::move(weak_parent)](promise_base *) mutable {
