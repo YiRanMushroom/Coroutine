@@ -519,12 +519,12 @@ namespace coroutine {
                 m_execution_context = context;
             }
 
-            inline void pin() {
-                if (m_pinned_self) {
-                    return;
-                }
-                m_pinned_self = ref_counted_resource_handle(this, resource_acquisition_semantics::copy{});
-            }
+            // inline void pin() {
+            //     if (m_pinned_self) {
+            //         return;
+            //     }
+            //     m_pinned_self = ref_counted_resource_handle(this, resource_acquisition_semantics::copy{});
+            // }
 
             inline ref_counted_resource_handle borrow() const noexcept {
                 return ref_counted_resource_handle(const_cast<promise_base *>(this),
@@ -536,18 +536,23 @@ namespace coroutine {
                                                         resource_acquisition_semantics::copy{});
             }
 
-            inline void unpin() {
-                m_pinned_self.reset();
-            }
+            // inline void unpin() {
+            //     m_pinned_self.reset();
+            // }
 
         protected:
             void release_resources() noexcept override {
                 m_should_be_cancelled = true;
-                if (m_coroutine_handle && !m_coroutine_handle.done()) {
-                    m_coroutine_handle.resume();
-                }
                 auto weak_self = weak_borrow();
-                m_pinned_self.reset();
+                // this->unpin();
+
+                if (m_coroutine_handle && !m_coroutine_handle.done()) {
+                    if (is_cancelable()) {
+                        m_coroutine_handle.resume();
+                    } else {
+                        m_coroutine_handle.resume();
+                    }
+                }
             }
 
             inline void destroy() noexcept override {
@@ -555,7 +560,7 @@ namespace coroutine {
 
                 // this->unpin();
 
-                assert(!m_pinned_self);
+                // assert(!m_pinned_self);
 
                 // std::cout << std::format("m_pinned_self is :{}", (void *) this->m_pinned_self.get()) << std::endl;
 
@@ -570,7 +575,8 @@ namespace coroutine {
 
         protected:
             void finalize_finished_promise() {
-                this->unpin();
+                // this->unpin();
+
                 if (auto moved = std::move(*this).get_continuation()) {
                     moved(this);
                 }
@@ -683,11 +689,20 @@ namespace coroutine {
         };
     }
 
+    class ref_counted_resource_handle;
+    class ref_counted_resource_weak_handle;
+
     class execution_context {
     public:
         virtual ~execution_context() = default;
 
-        virtual void resume_promise_weak(_details::promise_base *promise) = 0;
+        void resume_promise(_details::promise_base *promise);
+
+        virtual void resume_promise_weak(_details::ref_counted_resource_weak_handle weak_handle,
+                                         _details::promise_base *promise) = 0;
+
+        virtual void resume_promise_strong(_details::ref_counted_resource_handle strong_handle,
+                                           _details::promise_base *promise) = 0;
 
         template<template<typename...> typename TaskType, typename T, typename... Args>
         NO_ASAN T block_on(TaskType<T, Args...> task);
@@ -704,6 +719,16 @@ namespace coroutine {
     public:
         inline static std::atomic_size_t resumed_promise_count = 0;
     };
+
+    inline void execution_context::resume_promise(_details::promise_base *promise) {
+        assert(promise);
+
+        // if (promise->is_cancelable()) {
+        this->resume_promise_weak(promise->weak_borrow(), promise);
+        // } else {
+        // this->resume_promise_strong(promise->borrow(), promise);
+        // }
+    }
 
 
     namespace _details {
@@ -929,16 +954,26 @@ namespace coroutine {
 
                         auto *local_ctx = promise->get_execution_context();
 
-                        promise->set_continuation([weak_parent = std::move(weak_parent)](promise_base *) mutable {
-                            auto parent = weak_parent.lock();
-                            if (!parent) {
-                                return;
-                            }
-                            auto *p = static_cast<promise_base *>(parent.get());
-                            p->get_execution_context()->resume_promise_weak(p);
-                        });
 
-                        local_ctx->resume_promise_weak(promise);
+                        if (m_parent_promise->is_cancelable()) {
+                            promise->set_continuation([weak_parent = std::move(weak_parent)](promise_base *) mutable {
+                                auto parent = weak_parent.lock();
+                                if (!parent) {
+                                    return;
+                                }
+                                auto *p = static_cast<promise_base *>(parent.get());
+                                p->get_execution_context()->resume_promise(p);
+                            });
+                        } else {
+                            promise->set_continuation(
+                                [strong_parent = m_parent_promise->borrow()](promise_base *) mutable {
+                                    auto *p = static_cast<promise_base *>(strong_parent.get());
+                                    p->get_execution_context()->resume_promise(p);
+                                });
+                        }
+
+
+                        local_ctx->resume_promise(promise);
 
                         // m_submitted.release();
                     }
@@ -1065,8 +1100,8 @@ namespace coroutine {
                           std::max({4u, 2 * std::jthread::hardware_concurrency(), 2 * thread_count}))) {}
 
 
-            void resume_promise_weak(promise_base *promise) override {
-                auto weak_handle = promise->weak_borrow();
+            void resume_promise_weak(ref_counted_resource_weak_handle handle, promise_base *promise) override {
+                auto weak_handle = std::move(handle);
 
                 auto task = [_weak_handle = std::move(weak_handle)] mutable {
                     auto weak_handle = std::move(_weak_handle);
@@ -1080,9 +1115,36 @@ namespace coroutine {
                     auto *promise = static_cast<promise_base *>(locked.get());
                     const std::coroutine_handle<> handle = promise->get_coroutine_handle();
 
-                    if (!promise->is_cancelable()) {
-                        promise->pin();
+
+                    if (handle && !handle.done()) {
+                        handle.resume();
+                    } else {
+                        __debugbreak();
                     }
+                };
+
+                if (promise->get_task_hint() & promise_base::e_io) {
+                    m_io_thread_pool->enqueue_detach(std::move(task));
+                    return;
+                }
+
+                m_thread_pool->enqueue_detach(std::move(task));
+            }
+
+            void resume_promise_strong(ref_counted_resource_handle handle, promise_base *promise) override {
+                auto strong_handle = std::move(handle);
+
+
+                auto task = [_strong_handle = std::move(strong_handle)] mutable {
+                    auto strong_handle = std::move(_strong_handle);
+                    if (!strong_handle) {
+                        return;
+                    }
+
+                    resumed_promise_count.fetch_add(1, std::memory_order_relaxed);
+
+                    auto *promise = static_cast<promise_base *>(strong_handle.get());
+                    const std::coroutine_handle<> handle = promise->get_coroutine_handle();
 
                     if (handle && !handle.done()) {
                         handle.resume();
@@ -1139,7 +1201,7 @@ namespace coroutine {
 
         promise->set_task_hint(_details::promise_base::e_none);
 
-        resume_promise_weak(promise);
+        resume_promise(promise);
 
         semaphore.acquire();
         this->wait_idle();
@@ -1429,14 +1491,14 @@ namespace coroutine {
                                 auto all_of_state = &parent_promise->state;
 
                                 if (all_of_state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                                    parent_promise->get_execution_context()->resume_promise_weak(parent_promise);
+                                    parent_promise->get_execution_context()->resume_promise(parent_promise);
                                 }
                             });
                         }(std::integral_constant<size_t, Is>{}), ...);
                     }(std::index_sequence_for<typename Tasks::value_type...>{});
 
                     for (promise_base *task_promise: to_start) {
-                        exec_ctx->resume_promise_weak(task_promise);
+                        exec_ctx->resume_promise(task_promise);
                     }
                 });
 
@@ -1511,14 +1573,14 @@ namespace coroutine {
                                     std::get<idx>(parent_promise->state.result) =
                                             static_cast<decltype(std::get<idx>(parent_promise->state.non_throw_tasks).
                                                 get_promise())>(task_promise)->get_result_move();
-                                    parent_promise->get_execution_context()->resume_promise_weak(parent_promise);
+                                    parent_promise->get_execution_context()->resume_promise(parent_promise);
                                 }
                             });
                         }(std::integral_constant<size_t, Is>{}), ...);
                     }(std::index_sequence_for<typename Tasks::value_type...>{});
 
                     for (promise_base *task_promise: to_start) {
-                        exec_ctx->resume_promise_weak(task_promise);
+                        exec_ctx->resume_promise(task_promise);
                     }
                 });
 
@@ -1584,13 +1646,13 @@ namespace coroutine {
                             auto all_of_state = &parent_promise->state;
 
                             if (all_of_state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                                parent_promise->get_execution_context()->resume_promise_weak(parent_promise);
+                                parent_promise->get_execution_context()->resume_promise(parent_promise);
                             }
                         });
                     }
 
                     for (promise_base *task_promise: to_start) {
-                        exec_ctx->resume_promise_weak(task_promise);
+                        exec_ctx->resume_promise(task_promise);
                     }
                 });
 
@@ -1667,13 +1729,13 @@ namespace coroutine {
                             if (!state->finished.exchange(true, std::memory_order_acq_rel)) {
                                 parent_promise->state.result[idx] = static_cast<decltype(parent_promise->state.
                                     non_throw_tasks[idx].get_promise())>(task_promise)->get_result_move();
-                                parent_promise->get_execution_context()->resume_promise_weak(parent_promise);
+                                parent_promise->get_execution_context()->resume_promise(parent_promise);
                             }
                         });
                     }
 
                     for (promise_base *task_promise: to_start) {
-                        exec_ctx->resume_promise_weak(task_promise);
+                        exec_ctx->resume_promise(task_promise);
                     }
                 });
 
@@ -1792,10 +1854,10 @@ namespace coroutine {
                                 return;
                             }
                             auto *p = static_cast<promise_base *>(parent.get());
-                            p->get_execution_context()->resume_promise_weak(p);
+                            p->get_execution_context()->resume_promise(p);
                         });
 
-                        local_ctx->resume_promise_weak(promise);
+                        local_ctx->resume_promise(promise);
                     }
 
                     decltype(auto) await_resume() {

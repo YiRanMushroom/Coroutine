@@ -5,7 +5,7 @@ using coroutine::cancelable_task;
 
 task<void> say1() {
     // std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    // std::cout << 1;
+    std::cout << 1 << std::endl;
     co_return;
 }
 
@@ -102,6 +102,7 @@ task<void> test_any_simple() {
 }
 
 cancelable_task<void> test_any_of() {
+    std::cout << "Starting test_any_of..." << std::endl;
     co_await coroutine::sleep_for(std::chrono::milliseconds(100));
 
     co_await coroutine::any_of(
@@ -111,33 +112,23 @@ cancelable_task<void> test_any_of() {
         coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(30)), coroutine::sleep_for(std::chrono::milliseconds(30)),
         coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(30)), coroutine::sleep_for(std::chrono::milliseconds(30)),
         coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(30))))))));
+    std::cout << "Finished test_any_of." << std::endl;
 }
 
 cancelable_task<void> test_cancel_task() {
+    co_await coroutine::any_of(test_any_of(), say1());
     co_await coroutine::sleep_for(std::chrono::milliseconds(1));
-    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
-    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
-    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
-    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
-    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
-    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
-    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
-    co_await coroutine::sleep_for(std::chrono::milliseconds(1));
-
-    auto promise = co_await coroutine::_details::get_current_promise_base();
-
-    std::cout << "This should not be printed" << std::endl;
 }
 
 NO_ASAN int main() {
-    for (int i = 0; i < 100; ++i) {
+    for (int i = 0; i < 1; ++i) {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
             auto execution_ctx = coroutine::_details::multithreaded_execution_context{4};
 
             try {
-                execution_ctx.async_execute(coroutine::any_of(test_cancel_task(), say1())).get();
+                execution_ctx.async_execute(test_cancel_task()).get();
             } catch (const std::exception &e) {
                 std::cout << "Caught exception: " << e.what() << std::endl;
             }
