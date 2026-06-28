@@ -108,10 +108,16 @@ cancelable_task<void> test_any_of() {
     co_await coroutine::any_of(
         coroutine::sleep_for(std::chrono::milliseconds(10)),
         coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(20)),
-        coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(30)), coroutine::sleep_for(std::chrono::milliseconds(30)),
-        coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(30)), coroutine::sleep_for(std::chrono::milliseconds(30)),
-        coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(30)), coroutine::sleep_for(std::chrono::milliseconds(30)),
-        coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(30))))))));
+                          coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(30)),
+                                            coroutine::sleep_for(std::chrono::milliseconds(30)),
+                                            coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(30)),
+                                                              coroutine::sleep_for(std::chrono::milliseconds(30)),
+                                                              coroutine::any_of(
+                                                                  coroutine::sleep_for(std::chrono::milliseconds(30)),
+                                                                  coroutine::sleep_for(std::chrono::milliseconds(30)),
+                                                                  coroutine::any_of(
+                                                                      coroutine::sleep_for(
+                                                                          std::chrono::milliseconds(30))))))));
     std::cout << "Finished test_any_of." << std::endl;
 }
 
@@ -120,15 +126,23 @@ cancelable_task<void> test_cancel_task() {
     co_await coroutine::sleep_for(std::chrono::milliseconds(1));
 }
 
+task<void> test_future() {
+    co_await std::async([] {
+        std::cout << "Hello from std::async!" << std::endl;
+    });
+
+    std::cout << "Now testing coroutine future..." << std::endl;
+}
+
 NO_ASAN int main() {
-    for (int i = 0; i < 1000; ++i) {
+    for (int i = 0; i < 10; ++i) {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
             auto execution_ctx = coroutine::_details::multithreaded_execution_context{4};
 
             try {
-                execution_ctx.async_execute(test_cancel_task()).get();
+                execution_ctx.async_execute(test_future()).get();
             } catch (const std::exception &e) {
                 std::cout << "Caught exception: " << e.what() << std::endl;
             }

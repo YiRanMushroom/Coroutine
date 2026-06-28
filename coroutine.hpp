@@ -438,6 +438,16 @@ namespace coroutine {
             return g_promise_count.load();
         }
 
+        template<typename T>
+        struct promise_base_transformer {
+            constexpr static bool need_forwarding = false;
+
+            template<typename Awaitable>
+            static decltype(auto) do_transform(Awaitable&& awaitable) {
+                return std::forward<Awaitable>(awaitable);
+            }
+        };
+
         class promise_base : public pin_resource_base {
             template<typename T>
             friend class task_base;
@@ -492,7 +502,13 @@ namespace coroutine {
             template<typename T> requires (!is_awaitable<T>)
             decltype(auto) await_transform(T &&value) {
                 throw_if_cancelled();
-                return std::forward<T>(value);
+
+                using transformer_type = promise_base_transformer<std::remove_cvref_t<T>>;
+                if constexpr (transformer_type::need_forwarding) {
+                    return await_transform(transformer_type::do_transform(std::forward<T>(value)));
+                } else {
+                    return transformer_type::do_transform(std::forward<T>(value));
+                }
             }
 
             std::move_only_function<void(promise_base *)> get_continuation() && noexcept {
@@ -944,7 +960,7 @@ namespace coroutine {
                 promise->set_cancelable_temporary(promise->is_cancelable() && parent_promise->is_cancelable());
 
                 struct awaiter {
-                    task_base<T> *m_task;
+                    task_base<T> m_task;
                     promise_base *m_parent_promise;
 
                     // std::binary_semaphore m_submitted{0};
@@ -957,7 +973,7 @@ namespace coroutine {
                         execution_context *context = m_parent_promise->get_execution_context();
                         assert(context);
 
-                        promise_base *promise = m_task->get_promise();
+                        promise_base *promise = m_task.get_promise();
                         if (!promise->get_execution_context()) {
                             promise->set_execution_context(context);
                         }
@@ -993,11 +1009,11 @@ namespace coroutine {
 
                     auto await_resume() {
                         // m_submitted.acquire();
-                        return m_task->get_promise()->get_result_move();
+                        return m_task.get_promise()->get_result_move();
                     }
                 };
 
-                return awaiter{this, parent_promise};
+                return awaiter{std::move(*this), parent_promise};
             }
 
             T await_resume() {
@@ -1902,7 +1918,10 @@ namespace coroutine {
         }
 
         template<typename T>
-        task<T> asyncify(std::future<T> future) {
+        class COROUTINE_AWAIT_ELIDABLE io_task;
+
+        template<typename T>
+        io_task<T> asyncify(std::future<T> future) {
             co_return future.get();
         }
     }
@@ -2011,4 +2030,16 @@ namespace coroutine {
     using _details::interrupted_exception;
     using _details::wait_for_semaphore;
     using _details::sleep_for;
+
+    namespace _details {
+        template<typename T>
+        struct promise_base_transformer<std::future<T>> {
+            constexpr static bool need_forwarding = true;
+
+            template<typename U>
+            static io_task<T> do_transform(U future) {
+                return asyncify(std::move(future));
+            }
+        };
+    }
 }
