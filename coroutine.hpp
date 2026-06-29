@@ -443,7 +443,7 @@ namespace coroutine {
             constexpr static bool need_forwarding = false;
 
             template<typename Awaitable>
-            static decltype(auto) do_transform(Awaitable&& awaitable) {
+            static decltype(auto) do_transform(Awaitable &&awaitable) {
                 return std::forward<Awaitable>(awaitable);
             }
         };
@@ -1122,11 +1122,16 @@ namespace coroutine {
 
         class multithreaded_execution_context : public execution_context {
         public:
-            explicit multithreaded_execution_context(uint32_t thread_count = std::jthread::hardware_concurrency())
+            explicit multithreaded_execution_context(uint32_t thread_count = std::jthread::hardware_concurrency(),
+                                                     uint32_t io_thread_count =
+                                                             std::max({
+                                                                     4u, 2 * std::jthread::hardware_concurrency()
+                                                                 }))
                 : m_thread_pool(std::make_unique<dp_thread_pool::thread_pool<>>(thread_count)),
                   m_io_thread_pool(
                       std::make_unique<dp_thread_pool::thread_pool<>>(
-                          std::max({4u, 2 * std::jthread::hardware_concurrency(), 2 * thread_count}))) {}
+                          io_thread_count
+                      )) {}
 
 
             void resume_promise_weak(ref_counted_resource_weak_handle handle, promise_base *promise) override {
