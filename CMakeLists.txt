@@ -9,8 +9,8 @@ option(ENABLE_ASAN "Enable AddressSanitizer" ON)
 
 if(ENABLE_ASAN)
     if(MSVC)
-        target_compile_options(asan_profile INTERFACE /fsanitize=address)
-        target_link_options(asan_profile INTERFACE /fsanitize=address)
+#        target_compile_options(asan_profile INTERFACE /fsanitize=address)
+#        target_link_options(asan_profile INTERFACE /fsanitize=address)
 
     else()
         

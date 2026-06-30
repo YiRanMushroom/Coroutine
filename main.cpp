@@ -105,19 +105,20 @@ cancelable_task<void> test_any_of() {
     std::cout << "Starting test_any_of..." << std::endl;
     co_await coroutine::sleep_for(std::chrono::milliseconds(100));
 
-    co_await coroutine::any_of(
-        coroutine::sleep_for(std::chrono::milliseconds(10)),
-        coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(20)),
-                          coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(30)),
-                                            coroutine::sleep_for(std::chrono::milliseconds(30)),
-                                            coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(30)),
-                                                              coroutine::sleep_for(std::chrono::milliseconds(30)),
-                                                              coroutine::any_of(
-                                                                  coroutine::sleep_for(std::chrono::milliseconds(30)),
-                                                                  coroutine::sleep_for(std::chrono::milliseconds(30)),
-                                                                  coroutine::any_of(
-                                                                      coroutine::sleep_for(
-                                                                          std::chrono::milliseconds(30))))))));
+
+    // co_await coroutine::any_of(
+    //     coroutine::sleep_for(std::chrono::milliseconds(10)),
+    //     coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(20)),
+    //                       coroutine::all_of(coroutine::sleep_for(std::chrono::milliseconds(30)),
+    //                                         coroutine::sleep_for(std::chrono::milliseconds(30)),
+    //                                         coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(30)),
+    //                                                           coroutine::sleep_for(std::chrono::milliseconds(30)),
+    //                                                           coroutine::all_of(
+    //                                                               coroutine::sleep_for(std::chrono::milliseconds(30)),
+    //                                                               coroutine::sleep_for(std::chrono::milliseconds(30)),
+    //                                                               coroutine::any_of(
+    //                                                                   coroutine::sleep_for(
+    //                                                                       std::chrono::milliseconds(30))))))));
     std::cout << "Finished test_any_of." << std::endl;
 }
 
@@ -142,7 +143,7 @@ NO_ASAN int main() {
             auto execution_ctx = coroutine::_details::multithreaded_execution_context{4};
 
             try {
-                execution_ctx.async_execute(test_future()).get();
+                execution_ctx.co_spawn(test_any_of());
             } catch (const std::exception &e) {
                 std::cout << "Caught exception: " << e.what() << std::endl;
             }

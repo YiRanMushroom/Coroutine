@@ -27,6 +27,7 @@
 #endif
 
 #include <shared_mutex>
+#include <source_location>
 
 #include "coroutine.hpp"
 #include "thread_pool/thread_pool.h"
@@ -165,9 +166,11 @@ namespace coroutine {
         concept is_awaitable = std::derived_from<std::remove_cvref_t<T>, abstract_awaitable_base>;
 
         inline namespace resource_acquisition_semantics {
-            struct adopt {};
+            struct adopt {
+            };
 
-            struct copy {};
+            struct copy {
+            };
         }
 
         class ref_counted_resource_weak_handle;
@@ -320,7 +323,8 @@ namespace coroutine {
             }
 
             ref_counted_resource_weak_handle(ref_counted_resource_weak_handle &&other) noexcept : m_resource(
-                std::exchange(other.m_resource, nullptr)) {}
+                std::exchange(other.m_resource, nullptr)) {
+            }
 
             ref_counted_resource_weak_handle &operator=(const ref_counted_resource_weak_handle &other) noexcept {
                 if (this != &other) {
@@ -398,13 +402,15 @@ namespace coroutine {
             future_base() noexcept = default;
 
             future_base(ref_counted_resource_handle coroutine_handle) noexcept : m_coroutine_handle(
-                std::move(coroutine_handle)) {}
+                std::move(coroutine_handle)) {
+            }
 
             future_base(const future_base &) = delete;
 
             future_base &operator=(const future_base &) = delete;
 
-            future_base(future_base &&other) noexcept : m_coroutine_handle(std::move(other.m_coroutine_handle)) {}
+            future_base(future_base &&other) noexcept : m_coroutine_handle(std::move(other.m_coroutine_handle)) {
+            }
 
             future_base &operator=(future_base &&other) noexcept {
                 if (this != &other) {
@@ -715,8 +721,6 @@ namespace coroutine {
         };
     }
 
-    class ref_counted_resource_handle;
-    class ref_counted_resource_weak_handle;
 
     class execution_context {
     public:
@@ -742,6 +746,8 @@ namespace coroutine {
 
         virtual void wait_idle() = 0;
 
+        virtual void co_spawn(_details::task_base<void> coroutine) = 0;
+
     public:
         inline static std::atomic_size_t resumed_promise_count = 0;
     };
@@ -766,7 +772,8 @@ namespace coroutine {
         }
 
         inline namespace result_state {
-            struct not_finished {};
+            struct not_finished {
+            };
 
             template<typename T>
             using finished = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
@@ -902,7 +909,8 @@ namespace coroutine {
         public:
         };
 
-        struct task_base_flag {};
+        struct task_base_flag {
+        };
 
         template<typename T>
         class COROUTINE_AWAIT_ELIDABLE task_base : public abstract_awaitable_base, public future_base,
@@ -925,7 +933,8 @@ namespace coroutine {
             task_base &operator=(task_base &&) = default;
 
             task_base(ref_counted_resource_handle coroutine_handle) noexcept : future_base(
-                std::move(coroutine_handle)) {}
+                std::move(coroutine_handle)) {
+            }
 
             [[nodiscard]] promise<T> *get_promise() const {
                 promise_base *base = this->get_promise_base();
@@ -1085,7 +1094,8 @@ namespace coroutine {
         public:
             using typename task_base<T>::promise_type;
 
-            task(ref_counted_resource_handle &&coroutine_handle) noexcept : task_base<T>(std::move(coroutine_handle)) {}
+            task(ref_counted_resource_handle &&coroutine_handle) noexcept : task_base<T>(std::move(coroutine_handle)) {
+            }
 
             task() = default;
 
@@ -1098,7 +1108,8 @@ namespace coroutine {
             task &operator=(task &&) = default;
 
             template<std::derived_from<task_base<T>>>
-            task(task_base<T> &&base) noexcept : task<T>(std::move(base).release_handle()) {}
+            task(task_base<T> &&base) noexcept : task<T>(std::move(base).release_handle()) {
+            }
         };
 
         struct get_context_type : abstract_awaitable_base, std::suspend_never {
@@ -1125,13 +1136,14 @@ namespace coroutine {
             explicit multithreaded_execution_context(uint32_t thread_count = std::jthread::hardware_concurrency(),
                                                      uint32_t io_thread_count =
                                                              std::max({
-                                                                     4u, 2 * std::jthread::hardware_concurrency()
-                                                                 }))
+                                                                 4u, 2 * std::jthread::hardware_concurrency()
+                                                             }))
                 : m_thread_pool(std::make_unique<dp_thread_pool::thread_pool<>>(thread_count)),
                   m_io_thread_pool(
                       std::make_unique<dp_thread_pool::thread_pool<>>(
                           io_thread_count
-                      )) {}
+                      )) {
+            }
 
 
             void resume_promise_weak(ref_counted_resource_weak_handle handle, promise_base *promise) override {
@@ -1211,6 +1223,23 @@ namespace coroutine {
 
             void unlock() override {
                 m_lock.unlock_shared();
+            }
+
+            void co_spawn(_details::task_base<void> coroutine) override {
+                promise_base *promise = coroutine.get_promise();
+
+                promise->set_execution_context(this);
+
+                promise->set_cancelable(false);
+
+                promise->set_continuation([this](promise_base *promise) {
+                    this->unlock();
+                });
+
+                auto handle = std::move(coroutine).release_handle();
+
+                this->lock();
+                this->resume_promise_strong(std::move(handle), promise);
             }
 
         private:
@@ -1336,7 +1365,8 @@ namespace coroutine {
             ex_task() = default;
 
             ex_task(ref_counted_resource_handle &&coroutine_handle) noexcept : task_base<T>(
-                std::move(coroutine_handle)) {}
+                std::move(coroutine_handle)) {
+            }
 
             ex_promise<T, S> *get_ex_promise() const {
                 return static_cast<ex_promise<T, S> *>(this->get_promise_base());
@@ -1399,7 +1429,8 @@ namespace coroutine {
             Func m_callback; // Func must be static and cannot capture any references
             std::binary_semaphore m_semaphore{0};
 
-            suspend_and_then_t(Func &&callback) : m_callback(std::move(callback)) {}
+            suspend_and_then_t(Func &&callback) : m_callback(std::move(callback)) {
+            }
 
             void await_suspend(std::coroutine_handle<> h) noexcept {
                 m_callback(h);
@@ -1443,7 +1474,8 @@ namespace coroutine {
 
             std::coroutine_handle<promise_type> coro;
 
-            immediate_value_task(std::coroutine_handle<promise_type> h) : coro(h) {}
+            immediate_value_task(std::coroutine_handle<promise_type> h) : coro(h) {
+            }
 
             immediate_value_task(const immediate_value_task &) = delete;
 
@@ -1965,7 +1997,8 @@ namespace coroutine {
         class COROUTINE_AWAIT_ELIDABLE interruptable_task : public task_base<T> {
         public:
             interruptable_task(ref_counted_resource_handle &&coroutine_handle) noexcept : task_base<T>(
-                std::move(coroutine_handle)) {}
+                std::move(coroutine_handle)) {
+            }
 
             interruptable_task() = default;
 
