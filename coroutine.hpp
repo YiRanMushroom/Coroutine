@@ -2069,16 +2069,4 @@ namespace coroutine {
     using _details::interrupted_exception;
     using _details::wait_for_semaphore;
     using _details::sleep_for;
-
-    // namespace _details {
-    //     template<typename T>
-    //     struct promise_base_transformer<std::future<T>> {
-    //         constexpr static bool need_forwarding = true;
-    //
-    //         template<typename U>
-    //         static io_task<T> do_transform(U future) {
-    //             return asyncify(std::move(future));
-    //         }
-    //     };
-    // }
 }
