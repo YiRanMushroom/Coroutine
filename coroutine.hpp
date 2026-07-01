@@ -783,9 +783,17 @@ namespace coroutine {
                 return m_context;
             }
 
+            execution_context* operator->() const {
+                return m_context;
+            }
+
         private:
             execution_context *m_context;
         };
+
+        context_lock_holder_type lock_this() {
+            return context_lock_holder_type(this);
+        }
 
     public:
         inline static std::atomic_size_t resumed_promise_count = 0;
@@ -1264,9 +1272,7 @@ namespace coroutine {
                 m_lock.unlock_shared();
             }
 
-            context_lock_holder_type lock_this() {
-                return context_lock_holder_type(this);
-            }
+
 
             void co_spawn(_details::task_base<void> coroutine) override {
                 promise_base *promise = coroutine.get_promise();
