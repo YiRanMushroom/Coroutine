@@ -748,6 +748,45 @@ namespace coroutine {
 
         virtual void co_spawn(_details::task_base<void> coroutine) = 0;
 
+        struct context_lock_holder_type {
+            context_lock_holder_type(execution_context *ctx) : m_context(ctx) {
+                m_context->lock();
+            }
+
+            context_lock_holder_type(const context_lock_holder_type &) = delete;
+            context_lock_holder_type &operator=(const context_lock_holder_type &) = delete;
+
+            context_lock_holder_type(context_lock_holder_type &&other) noexcept : m_context(std::exchange(other.m_context, nullptr)) {
+            }
+
+            context_lock_holder_type &operator=(context_lock_holder_type &&other) noexcept {
+                if (this != &other) {
+                    if (m_context) {
+                        m_context->unlock();
+                    }
+                    m_context = std::exchange(other.m_context, nullptr);
+                }
+                return *this;
+            }
+
+            ~context_lock_holder_type() {
+                if (m_context) {
+                    m_context->unlock();
+                }
+            }
+
+            context_lock_holder_type clone() const {
+                return {m_context};
+            }
+
+            execution_context* get_context() const {
+                return m_context;
+            }
+
+        private:
+            execution_context *m_context;
+        };
+
     public:
         inline static std::atomic_size_t resumed_promise_count = 0;
     };
@@ -1225,6 +1264,10 @@ namespace coroutine {
                 m_lock.unlock_shared();
             }
 
+            context_lock_holder_type lock_this() {
+                return context_lock_holder_type(this);
+            }
+
             void co_spawn(_details::task_base<void> coroutine) override {
                 promise_base *promise = coroutine.get_promise();
 
@@ -1232,13 +1275,14 @@ namespace coroutine {
 
                 promise->set_cancelable(false);
 
-                promise->set_continuation([this](promise_base *promise) {
-                    this->unlock();
+                auto locked_self = this->lock_this();
+
+                promise->set_continuation([_lock = std::move(locked_self)](promise_base *promise) mutable {
+                    auto lock = std::move(_lock);
                 });
 
                 auto handle = std::move(coroutine).release_handle();
 
-                this->lock();
                 this->resume_promise_strong(std::move(handle), promise);
             }
 
