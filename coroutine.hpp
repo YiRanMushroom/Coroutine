@@ -78,6 +78,19 @@ namespace coroutine {
             using Ts::operator()...;
         };
 
+        template<typename Fn>
+        struct deferred_guard {
+            Fn fn;
+
+            deferred_guard(Fn f) : fn(std::move(f)) {}
+
+            ~deferred_guard() {
+                std::move(fn)();
+            }
+
+            // move and copy are implicitly deleted
+        };
+
         template<typename T>
         class task_base;
 
@@ -532,14 +545,12 @@ namespace coroutine {
 
         protected:
             void finalize_finished_promise() {
-                try {
-                    if (auto moved = std::move(*this).get_continuation()) {
-                        moved(this);
-                    }
+                deferred_guard guard = [&] {
                     m_parent_handle.reset();
-                } catch (...) {
-                    m_parent_handle.reset();
-                    throw;
+                };
+
+                if (auto moved = std::move(*this).get_continuation()) {
+                    moved(this);
                 }
             }
 
