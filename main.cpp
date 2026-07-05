@@ -104,21 +104,11 @@ task<void> test_any_simple() {
 cancelable_task<void> test_any_of() {
     std::cout << "Starting test_any_of..." << std::endl;
     co_await coroutine::sleep_for(std::chrono::milliseconds(100));
+    co_await coroutine::sleep_for(std::chrono::milliseconds(100));
+    co_await coroutine::sleep_for(std::chrono::milliseconds(100));
+    co_await coroutine::sleep_for(std::chrono::milliseconds(100));
+    co_await coroutine::sleep_for(std::chrono::milliseconds(100));
 
-
-    // co_await coroutine::any_of(
-    //     coroutine::sleep_for(std::chrono::milliseconds(10)),
-    //     coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(20)),
-    //                       coroutine::all_of(coroutine::sleep_for(std::chrono::milliseconds(30)),
-    //                                         coroutine::sleep_for(std::chrono::milliseconds(30)),
-    //                                         coroutine::any_of(coroutine::sleep_for(std::chrono::milliseconds(30)),
-    //                                                           coroutine::sleep_for(std::chrono::milliseconds(30)),
-    //                                                           coroutine::all_of(
-    //                                                               coroutine::sleep_for(std::chrono::milliseconds(30)),
-    //                                                               coroutine::sleep_for(std::chrono::milliseconds(30)),
-    //                                                               coroutine::any_of(
-    //                                                                   coroutine::sleep_for(
-    //                                                                       std::chrono::milliseconds(30))))))));
     std::cout << "Finished test_any_of." << std::endl;
 }
 
@@ -136,14 +126,14 @@ task<void> test_future() {
 }
 
 NO_ASAN int main() {
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 1; ++i) {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
             auto execution_ctx = coroutine::_details::multithreaded_execution_context{4};
 
             try {
-                execution_ctx.co_spawn(test_any_of());
+                execution_ctx.co_spawn(test_cancel_task());
             } catch (const std::exception &e) {
                 std::cout << "Caught exception: " << e.what() << std::endl;
             }
