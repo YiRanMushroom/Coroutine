@@ -32,7 +32,7 @@
 #include "coroutine.hpp"
 #include "thread_pool/thread_pool.h"
 
-#define DO_HALO 0
+#define DO_HALO 1
 #if DO_HALO
 #if __clang__
 #define COROUTINE_AWAIT_ELIDABLE [[clang::coro_await_elidable]]
@@ -151,11 +151,13 @@ namespace coroutine {
             }
 
             inline void add_strong_reference() noexcept {
-                m_strong_count.fetch_add(1, std::memory_order_relaxed);
+                auto old = m_strong_count.fetch_add(1, std::memory_order_relaxed);
+                assert(old > 0 && "Logic error: adding strong reference when count is already zero.");
             }
 
             inline void add_weak_reference() noexcept {
-                m_weak_count.fetch_add(1, std::memory_order_relaxed);
+                auto old = m_weak_count.fetch_add(1, std::memory_order_relaxed);
+                assert(old > 0 && "Logic error: adding weak reference when count is already zero.");
             }
 
             inline bool lock() noexcept {
@@ -311,6 +313,7 @@ namespace coroutine {
 
             ref_counted_resource_weak_handle(pin_resource_base *resource,
                                              resource_acquisition_semantics::copy) noexcept : m_resource(resource) {
+
                 if (m_resource) {
                     m_resource->add_weak_reference();
                 }
@@ -492,7 +495,7 @@ namespace coroutine {
                 }
             }
 
-            std::move_only_function<void(promise_base *)> get_continuation() && noexcept {
+            std::move_only_function<ref_counted_resource_weak_handle(promise_base *)> get_continuation() && noexcept {
                 if (m_in_continuation_access.fetch_add(1) != 0) {
                     __debugbreak();
                 }
@@ -502,7 +505,7 @@ namespace coroutine {
             }
 
         public:
-            inline void set_continuation(std::move_only_function<void(promise_base *)> continuation) {
+            inline void set_continuation(std::move_only_function<ref_counted_resource_weak_handle(promise_base *)> continuation) {
                 if (m_in_continuation_access.fetch_add(1) != 0) {
                     __debugbreak();
                 }
@@ -536,19 +539,24 @@ namespace coroutine {
 
             inline void destroy() noexcept override {
                 // auto moved_parent = std::move(m_parent_handle);
+
+                m_continuation = nullptr;
+
                 this->m_coroutine_handle.destroy();
             }
 
         protected:
-            void finalize_finished_promise() {
+            ref_counted_resource_weak_handle finalize_finished_promise() {
                 if (auto moved = std::move(*this).get_continuation()) {
-                    moved(this);
+                    return moved(this);
                 }
+                
+                return {};
             }
 
         public:
-            void on_finished() {
-                finalize_finished_promise();
+            ref_counted_resource_weak_handle on_finished() {
+                return finalize_finished_promise();
             }
 
         public:
@@ -558,7 +566,7 @@ namespace coroutine {
             };
 
         protected:
-            std::move_only_function<void(promise_base *)> m_continuation;
+            std::move_only_function<ref_counted_resource_weak_handle(promise_base *)> m_continuation;
             execution_context *m_execution_context = nullptr;
             // ref_counted_resource_weak_handle m_parent_handle{};
             ref_counted_resource_handle m_child_handle{};
@@ -953,17 +961,16 @@ namespace coroutine {
 
                         auto weak_parent = m_parent_promise->weak_borrow();
 
-                        // promise->set_parent(weak_parent);
-
                         auto *local_ctx = promise->get_execution_context();
 
                         promise->set_continuation([weak_parent = std::move(weak_parent)](promise_base *) mutable {
                             auto parent = weak_parent.lock();
                             if (!parent) {
-                                return;
+                                return std::move(weak_parent);
                             }
                             auto *p = static_cast<promise_base *>(parent.get());
                             p->get_execution_context()->resume_promise(p);
+                            return std::move(weak_parent);
                         });
 
                         local_ctx->resume_promise(promise);
@@ -1103,6 +1110,7 @@ namespace coroutine {
                 promise_base *promise = static_cast<promise_base *>(weak_handle.get_raw());
 
                 auto task = [_weak_handle = std::move(weak_handle)] mutable {
+                    ref_counted_resource_weak_handle parent_handle{};
                     auto weak_handle = std::move(_weak_handle);
                     auto locked = weak_handle.lock();
                     if (!locked) {
@@ -1121,7 +1129,7 @@ namespace coroutine {
                     }
 
                     if (handle.done() && promise->should_try_finalize()) {
-                        promise->on_finished();
+                        parent_handle = promise->on_finished();
                     }
                 };
 
@@ -1139,6 +1147,7 @@ namespace coroutine {
                 promise_base *promise = static_cast<promise_base *>(strong_handle.get());
 
                 auto task = [_strong_handle = std::move(strong_handle)] mutable {
+                    ref_counted_resource_weak_handle parent_handle{};
                     auto strong_handle = std::move(_strong_handle);
                     if (!strong_handle) {
                         return;
@@ -1156,9 +1165,8 @@ namespace coroutine {
                     }
 
                     if (handle.done() && promise->should_try_finalize()) {
-                        promise->on_finished();
+                        parent_handle = promise->on_finished();
                     }
-
                 };
 
                 if (promise->get_task_hint() & promise_base::e_io) {
@@ -1203,6 +1211,8 @@ namespace coroutine {
                 promise_base *promise) mutable {
                         auto lock = std::move(_lock);
                         auto promise_lock = std::move(_promise_lock);
+
+                        return ref_counted_resource_weak_handle{};
                     });
 
                 auto handle = std::move(coroutine).release_handle();
@@ -1221,8 +1231,9 @@ namespace coroutine {
     NO_ASAN T execution_context::block_on(TaskType<T, Args...> task) {
         std::binary_semaphore semaphore{0};
 
-        std::move_only_function<void(_details::promise_base *)> continuation = [&](_details::promise_base *) {
+        std::move_only_function<_details::ref_counted_resource_weak_handle(_details::promise_base *)> continuation = [&](_details::promise_base *) {
             semaphore.release();
+            return _details::ref_counted_resource_weak_handle{};
         };
 
         auto *promise = task.get_promise();
@@ -1515,7 +1526,7 @@ namespace coroutine {
                                 auto parent = std::move(_parent);
                                 auto locked_parent = parent.lock();
                                 if (!locked_parent) {
-                                    return;
+                                    return std::move(parent);
                                 }
 
                                 auto *parent_promise = static_cast<promise_type *>(locked_parent.get());
@@ -1524,6 +1535,8 @@ namespace coroutine {
                                 if (all_of_state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                                     parent_promise->get_execution_context()->resume_promise(parent_promise);
                                 }
+
+                                return std::move(parent);
                             });
                         }(std::integral_constant<size_t, Is>{}), ...);
                     }(std::index_sequence_for<typename Tasks::value_type...>{});
@@ -1592,7 +1605,7 @@ namespace coroutine {
                                     auto locked_parent = weak_parent.lock();
 
                                     if (!locked_parent) {
-                                        return;
+                                        return std::move(weak_parent);
                                     }
 
                                     auto *parent_promise = static_cast<promise_type *>(locked_parent.get());
@@ -1604,6 +1617,8 @@ namespace coroutine {
                                                     get_promise())>(task_promise)->get_result_move();
                                         parent_promise->get_execution_context()->resume_promise(parent_promise);
                                     }
+
+                                    return std::move(weak_parent);
                                 });
                         }(std::integral_constant<size_t, Is>{}), ...);
                     }(std::index_sequence_for<typename Tasks::value_type...>{});
@@ -1668,7 +1683,7 @@ namespace coroutine {
                             auto parent = std::move(_parent);
                             auto locked_parent = parent.lock();
                             if (!locked_parent) {
-                                return;
+                                return std::move(parent);
                             }
 
                             auto *parent_promise = static_cast<promise_type *>(locked_parent.get());
@@ -1677,6 +1692,8 @@ namespace coroutine {
                             if (all_of_state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                                 parent_promise->get_execution_context()->resume_promise(parent_promise);
                             }
+
+                            return std::move(parent);
                         });
                     }
 
@@ -1747,7 +1764,7 @@ namespace coroutine {
 
                                 auto locked_parent = weak_parent.lock();
                                 if (!locked_parent) {
-                                    return;
+                                    return std::move(weak_parent);
                                 }
 
                                 auto *parent_promise = static_cast<promise_type *>(locked_parent.get());
@@ -1757,6 +1774,8 @@ namespace coroutine {
                                         non_throw_tasks[idx].get_promise())>(task_promise)->get_result_move();
                                     parent_promise->get_execution_context()->resume_promise(parent_promise);
                                 }
+
+                                return std::move(weak_parent);
                             });
                     }
 
@@ -1877,10 +1896,11 @@ namespace coroutine {
                         promise->set_continuation([weak_parent = std::move(weak_parent)](promise_base *) mutable {
                             auto parent = weak_parent.lock();
                             if (!parent) {
-                                return;
+                                return std::move(weak_parent);
                             }
                             auto *p = static_cast<promise_base *>(parent.get());
                             p->get_execution_context()->resume_promise(p);
+                            return std::move(weak_parent);
                         });
 
                         local_ctx->resume_promise(promise);
