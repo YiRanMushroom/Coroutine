@@ -28,7 +28,7 @@ task<void> say1() {
 
 cancelable_task<void> do_many_things(int n) {
     if (n < 2) {
-        co_return;
+        throw std::runtime_error("test exception");
     }
 
     co_await coroutine::any_of(do_many_things(n - 3), do_many_things(n - 2),
@@ -130,7 +130,7 @@ NO_ASAN int main() {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
-            auto execution_ctx = coroutine::_details::multithreaded_execution_context{3,1};
+            auto execution_ctx = coroutine::_details::multithreaded_execution_context{};
 
             try {
                 execution_ctx.co_spawn(do_many_things(16));
