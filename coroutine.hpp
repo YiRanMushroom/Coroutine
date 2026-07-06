@@ -32,19 +32,19 @@
 #include "coroutine.hpp"
 #include "thread_pool/thread_pool.h"
 
-// #define DO_HALO 0
-// #if DO_HALO
-// #if __clang__
-// #define COROUTINE_AWAIT_ELIDABLE [[clang::coro_await_elidable]]
-// #define COROUTINE_AWAIT_ELIDABLE_ARGUMENT [[clang::coro_await_elidable_argument]]
-// #else
-// #define COROUTINE_AWAIT_ELIDABLE
-// #define COROUTINE_AWAIT_ELIDABLE_ARGUMENT
-// #endif
-// #else
+#define DO_HALO 1
+#if DO_HALO
+#if __clang__
+#define COROUTINE_AWAIT_ELIDABLE [[clang::coro_await_elidable]]
+#define COROUTINE_AWAIT_ELIDABLE_ARGUMENT [[clang::coro_await_elidable_argument]]
+#else
 #define COROUTINE_AWAIT_ELIDABLE
 #define COROUTINE_AWAIT_ELIDABLE_ARGUMENT
-// #endif
+#endif
+#else
+#define COROUTINE_AWAIT_ELIDABLE
+#define COROUTINE_AWAIT_ELIDABLE_ARGUMENT
+#endif
 
 #if DO_DEBUG_PRINT
 #define debug_print(...) \
@@ -541,11 +541,13 @@ namespace coroutine {
 
         protected:
             void finalize_finished_promise() {
-                m_parent_handle.reset();
+
+                // auto moved_parent = std::move(m_parent_handle);
 
                 if (auto moved = std::move(*this).get_continuation()) {
                     moved(this);
                 }
+
             }
 
         public:
@@ -930,6 +932,7 @@ namespace coroutine {
 
                 struct awaiter {
                     promise_base *m_parent_promise;
+                    ref_counted_resource_weak_handle m_child_handle;
 
                     [[nodiscard]] constexpr static bool await_ready() noexcept {
                         return false;
@@ -940,6 +943,9 @@ namespace coroutine {
                         assert(context);
 
                         promise_base *promise = static_cast<promise_base *>(m_parent_promise->m_child_handle.get());
+
+                        m_child_handle = promise->m_child_handle;
+
                         if (!promise->get_execution_context()) {
                             promise->set_execution_context(context);
                         }
@@ -1580,7 +1586,7 @@ namespace coroutine {
                                 task_promise->set_execution_context(exec_ctx);
                             }
                             task_promise->set_continuation(
-                                [task_promise, weak_parent = std::move(parent)](promise_base *this_promise) mutable {
+                                [task_promise, weak_parent = parent](promise_base *this_promise) mutable {
                                     state_type *state = &static_cast<promise_type *>(weak_parent.get_raw())->state;
 
                                     auto locked_parent = weak_parent.lock();
@@ -1745,7 +1751,7 @@ namespace coroutine {
                             task_promise->set_execution_context(exec_ctx);
                         }
                         task_promise->set_continuation(
-                            [idx, weak_parent = std::move(parent)](promise_base *task_promise) mutable {
+                            [idx, weak_parent = parent](promise_base *task_promise) mutable {
                                 state_type *state = &static_cast<promise_type *>(weak_parent.get_raw())->state;
 
                                 auto locked_parent = weak_parent.lock();
