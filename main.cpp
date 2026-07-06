@@ -130,10 +130,10 @@ NO_ASAN int main() {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
-            auto execution_ctx = coroutine::_details::multithreaded_execution_context{4};
+            auto execution_ctx = coroutine::_details::multithreaded_execution_context{};
 
             try {
-                execution_ctx.co_spawn(test_cancel_task());
+                execution_ctx.co_spawn(do_many_things(12));
             } catch (const std::exception &e) {
                 std::cout << "Caught exception: " << e.what() << std::endl;
             }
