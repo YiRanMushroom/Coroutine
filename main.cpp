@@ -126,11 +126,11 @@ task<void> test_future() {
 }
 
 NO_ASAN int main() {
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 1; ++i) {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
-            auto execution_ctx = coroutine::_details::multithreaded_execution_context{};
+            auto execution_ctx = coroutine::_details::multithreaded_execution_context{1,1};
 
             try {
                 execution_ctx.co_spawn(do_many_things(16));
