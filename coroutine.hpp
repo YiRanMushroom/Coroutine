@@ -32,7 +32,7 @@
 #include "coroutine.hpp"
 #include "thread_pool/thread_pool.h"
 
-#define DO_HALO 1
+#define DO_HALO 0
 #if DO_HALO
 #if __clang__
 #define COROUTINE_AWAIT_ELIDABLE [[clang::coro_await_elidable]]
@@ -535,19 +535,15 @@ namespace coroutine {
             }
 
             inline void destroy() noexcept override {
-                auto moved_parent = std::move(m_parent_handle);
+                // auto moved_parent = std::move(m_parent_handle);
                 this->m_coroutine_handle.destroy();
             }
 
         protected:
             void finalize_finished_promise() {
-
-                // auto moved_parent = std::move(m_parent_handle);
-
                 if (auto moved = std::move(*this).get_continuation()) {
                     moved(this);
                 }
-
             }
 
         public:
@@ -564,7 +560,7 @@ namespace coroutine {
         protected:
             std::move_only_function<void(promise_base *)> m_continuation;
             execution_context *m_execution_context = nullptr;
-            ref_counted_resource_weak_handle m_parent_handle{};
+            // ref_counted_resource_weak_handle m_parent_handle{};
             ref_counted_resource_handle m_child_handle{};
             std::coroutine_handle<> m_coroutine_handle;
             std::atomic<int> m_in_continuation_access{0};
@@ -594,9 +590,9 @@ namespace coroutine {
                 cancelable = value;
             }
 
-            void set_parent(ref_counted_resource_weak_handle parent) noexcept {
-                m_parent_handle = std::move(parent);
-            }
+            // void set_parent(ref_counted_resource_weak_handle parent) noexcept {
+            //     // m_parent_handle = std::move(parent);
+            // }
 
             execution_context *get_execution_context() const noexcept {
                 return m_execution_context;
@@ -628,18 +624,23 @@ namespace coroutine {
                 return {static_cast<promise_base *>(&self)};
             }
 
-            struct final_awaiter_type : std::suspend_always {
-                promise_base *m_promise;
+            // struct final_awaiter_type : std::suspend_always {
+            //     promise_base *m_promise;
+            //
+            //
+            //     void await_suspend(std::coroutine_handle<> h) noexcept {
+            //         if (m_promise && m_promise->should_try_finalize()) {
+            //             m_promise->on_finished();
+            //         }
+            //     }
+            // };
 
-                void await_suspend(std::coroutine_handle<> h) const noexcept {
-                    if (m_promise && m_promise->should_try_finalize()) {
-                        m_promise->on_finished();
-                    }
-                }
-            };
+            // final_awaiter_type final_suspend() noexcept {
+            //     return final_awaiter_type{.m_promise = this};
+            // }
 
-            final_awaiter_type final_suspend() noexcept {
-                return final_awaiter_type{.m_promise = this};
+            std::suspend_always final_suspend() noexcept {
+                return {};
             }
 
         public:
@@ -760,7 +761,7 @@ namespace coroutine {
         template<typename T>
         class promise : public promise_base {
         public:
-            ~promise() = default;
+            virtual ~promise() = default;
 
         public:
             promise() = default;
@@ -952,7 +953,7 @@ namespace coroutine {
 
                         auto weak_parent = m_parent_promise->weak_borrow();
 
-                        promise->set_parent(weak_parent);
+                        // promise->set_parent(weak_parent);
 
                         auto *local_ctx = promise->get_execution_context();
 
@@ -1113,11 +1114,14 @@ namespace coroutine {
                     auto *promise = static_cast<promise_base *>(locked.get());
                     const std::coroutine_handle<> handle = promise->get_coroutine_handle();
 
-
                     if (handle && !handle.done()) {
                         handle.resume();
                     } else {
                         __debugbreak();
+                    }
+
+                    if (handle.done() && promise->should_try_finalize()) {
+                        promise->on_finished();
                     }
                 };
 
@@ -1150,6 +1154,11 @@ namespace coroutine {
                     } else {
                         __debugbreak();
                     }
+
+                    if (handle.done() && promise->should_try_finalize()) {
+                        promise->on_finished();
+                    }
+
                 };
 
                 if (promise->get_task_hint() & promise_base::e_io) {
@@ -1465,10 +1474,6 @@ namespace coroutine {
         struct all_of_args_shared_state {
             std::atomic_size_t remaining{sizeof...(T)};
             std::tuple<task_base<std::expected<T, std::exception_ptr>>...> non_throw_tasks;
-
-            void release_resources() noexcept {
-                non_throw_tasks = {};
-            }
         };
 
         template<typename... Tasks> requires (sizeof...(Tasks) > 0)
@@ -1502,7 +1507,7 @@ namespace coroutine {
                             promise_base *task_promise = std::get<idx>(state->non_throw_tasks).get_promise();
                             to_start[idx] = task_promise;
 
-                            task_promise->set_parent(parent);
+                            // task_promise->set_parent(parent);
                             if (task_promise->get_execution_context() == nullptr) {
                                 task_promise->set_execution_context(exec_ctx);
                             }
@@ -1543,11 +1548,6 @@ namespace coroutine {
             std::atomic_bool finished{false};
             std::tuple<task_base<std::expected<T, std::exception_ptr>>...> non_throw_tasks;
             std::tuple<std::optional<std::expected<T, std::exception_ptr>>...> result;
-
-            void release_resources() noexcept {
-                non_throw_tasks = {};
-                result = {};
-            }
         };
 
         template<typename... Tasks> requires (sizeof...(Tasks) > 0)
@@ -1581,7 +1581,7 @@ namespace coroutine {
                             promise_base *task_promise = std::get<idx>(state->non_throw_tasks).get_promise();
                             to_start[idx] = task_promise;
 
-                            task_promise->set_parent(parent);
+                            // task_promise->set_parent(parent);
                             if (task_promise->get_execution_context() == nullptr) {
                                 task_promise->set_execution_context(exec_ctx);
                             }
@@ -1622,10 +1622,6 @@ namespace coroutine {
         struct all_of_vector_shared_state {
             std::atomic_size_t remaining{0};
             std::vector<task_base<std::expected<T, std::exception_ptr>>> non_throw_tasks;
-
-            void release_resources() noexcept {
-                non_throw_tasks.clear();
-            }
         };
 
         template<typename Task>
@@ -1664,7 +1660,7 @@ namespace coroutine {
                         promise_base *task_promise = state->non_throw_tasks[idx].get_promise();
                         to_start.push_back(task_promise);
 
-                        task_promise->set_parent(parent);
+                        // task_promise->set_parent(parent);
                         if (task_promise->get_execution_context() == nullptr) {
                             task_promise->set_execution_context(exec_ctx);
                         }
@@ -1704,11 +1700,6 @@ namespace coroutine {
             std::atomic_bool finished{false};
             std::vector<task_base<std::expected<T, std::exception_ptr>>> non_throw_tasks;
             std::vector<std::optional<std::expected<T, std::exception_ptr>>> result;
-
-            void release_resources() noexcept {
-                non_throw_tasks.clear();
-                result.clear();
-            }
         };
 
         template<typename Task>
@@ -1746,7 +1737,7 @@ namespace coroutine {
                         promise_base *task_promise = state->non_throw_tasks[idx].get_promise();
                         to_start.push_back(task_promise);
 
-                        task_promise->set_parent(parent);
+                        // task_promise->set_parent(parent);
                         if (task_promise->get_execution_context() == nullptr) {
                             task_promise->set_execution_context(exec_ctx);
                         }
@@ -1879,7 +1870,7 @@ namespace coroutine {
 
                         auto weak_parent = m_parent_promise->weak_borrow();
 
-                        promise->set_parent(weak_parent);
+                        // promise->set_parent(weak_parent);
 
                         auto *local_ctx = promise->get_execution_context();
 
