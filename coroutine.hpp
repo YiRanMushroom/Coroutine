@@ -536,7 +536,6 @@ namespace coroutine {
 
             inline void destroy() noexcept override {
                 auto moved_parent = std::move(m_parent_handle);
-                this->m_parent_handle.reset();
                 this->m_coroutine_handle.destroy();
             }
 
