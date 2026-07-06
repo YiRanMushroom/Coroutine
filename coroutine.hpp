@@ -32,7 +32,8 @@
 #include "coroutine.hpp"
 #include "thread_pool/thread_pool.h"
 
-#define DO_HALO 1
+// it is impossible to use HALO with this design.
+#define DO_HALO 0
 #if DO_HALO
 #if __clang__
 #define COROUTINE_AWAIT_ELIDABLE [[clang::coro_await_elidable]]
@@ -540,8 +541,6 @@ namespace coroutine {
             inline void destroy() noexcept override {
                 // auto moved_parent = std::move(m_parent_handle);
 
-                m_continuation = nullptr;
-
                 this->m_coroutine_handle.destroy();
             }
 
@@ -565,13 +564,12 @@ namespace coroutine {
                 e_io = 1 << 0,
             };
 
-        public:
-            std::array<char, 32> m_trivial_storage{};
-
         protected:
             std::move_only_function<ref_counted_resource_weak_handle(promise_base *)> m_continuation;
+        public:
+            std::array<char, 32> m_trivial_storage{};
+        protected:
             execution_context *m_execution_context = nullptr;
-            // ref_counted_resource_weak_handle m_parent_handle{};
             ref_counted_resource_handle m_child_handle{};
             std::coroutine_handle<> m_coroutine_handle;
             std::atomic<int> m_in_continuation_access{0};
@@ -772,7 +770,7 @@ namespace coroutine {
         template<typename T>
         class promise : public promise_base {
         public:
-            virtual ~promise() = default;
+            ~promise() = default;
 
         public:
             promise() = default;
@@ -1624,7 +1622,8 @@ namespace coroutine {
                                     auto locked_parent = weak_parent.lock();
 
                                     if (!locked_parent) {
-                                        return std::move(weak_parent);
+                                        weak_parent.reset();
+                                        return std::move(logical_parent);
                                     }
 
                                     auto *parent_promise = static_cast<promise_type *>(locked_parent.get());
@@ -1637,7 +1636,9 @@ namespace coroutine {
                                         parent_promise->get_execution_context()->resume_promise(parent_promise);
                                     }
 
-                                    return std::move(weak_parent);
+                                    // return std::move(weak_parent);
+                                    weak_parent.reset();
+                                    return std::move(logical_parent);
                                 });
                         }(std::integral_constant<size_t, Is>{}), ...);
                     }(std::index_sequence_for<typename Tasks::value_type...>{});
