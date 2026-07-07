@@ -4,27 +4,9 @@ using coroutine::task;
 using coroutine::cancelable_task;
 
 task<void> say1() {
-    // std::this_thread::sleep_for(std::chrono::milliseconds(10));
     std::cout << 1 << std::endl;
     co_return;
 }
-
-// volatile char *volatile something = nullptr;
-//
-// task<void> say2() {
-//     volatile char padding[64];
-//     padding[0] = 1;
-//     something = padding;
-//     std::cout << 2;
-//     co_await say1();
-//     co_return;
-// }
-//
-// cancelable_task<void> say3() {
-//     auto *context = co_await coroutine::get_current_coroutine_context();
-//     co_await say2().with_context(context);
-// }
-
 
 cancelable_task<void> do_many_things(int n) {
     if (n < 2) {
@@ -34,7 +16,6 @@ cancelable_task<void> do_many_things(int n) {
     co_await coroutine::any_of(do_many_things(n - 3), do_many_things(n - 2),
                                coroutine::any_of(do_many_things(n - 4), do_many_things(n - 3)));
 
-    // co_await do_many_things(n - 1), co_await do_many_things(n - 2);
 
     co_await coroutine::all_of(do_many_things(n - 3), do_many_things(n - 4));
 
@@ -126,11 +107,11 @@ task<void> test_future() {
 }
 
 NO_ASAN int main() {
-    for (int i = 0; i < 1; ++i) {
+    for (int i = 0; i < 1000; ++i) {
         {
             std::cout << std::format("\nNow running test_many_asm() iteration {}\n", i) << std::endl;
 
-            auto execution_ctx = coroutine::_details::multithreaded_execution_context{};
+            auto execution_ctx = coroutine::_details::multithreaded_execution_context{4};
 
             try {
                 execution_ctx.co_spawn(do_many_things(16));
