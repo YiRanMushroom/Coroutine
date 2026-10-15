@@ -146,6 +146,21 @@ Clang 22 -O2, Clang 21 -O2 and MSVC /O2: all tests pass. ASan (Clang 22 -O1): ev
 runs and `any_of_in_loop` x 150: 0 failures. A debug build that aborts when a promise is constructed on
 top of a still-live one: 8 tests x 20 runs, 0 overlaps.
 
+### Tried and rejected: a frame recycling allocator
+
+A per-thread, size-class free-list allocator for non-elided frames (like Boost.Asio's recycling
+allocator). Medians of 5 runs: Clang `bench_sequential_awaits` 157 -> 125 ms and `bench_deep_chain`
+53 -> 36 ms, everything else within noise; MSVC (no HALO, every frame on the heap) unchanged. The Windows
+heap is already fast for small blocks, and frames are often freed on another thread than the one that
+allocated them, so the per-thread cache rarely hits. Not worth ~90 lines; removed.
+
+### Accepted cost of the structured design
+
+Waiting for the child's destruction instead of its completion makes the micro-benchmarks 2.5-3x slower
+than right after inline resumption was added (`bench_sequential_awaits` 62 -> ~157 ms,
+`bench_deep_chain` 18 -> ~53 ms), still ~3.5x faster than the original code. Considered acceptable;
+optimize only if it shows up in real use.
+
 ## 5. Open issues / ideas
 
 - `into_non_throw` of an `ex_task`/`any_of_task` creates a wrapper whose promise carries an unused
