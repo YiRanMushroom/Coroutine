@@ -105,6 +105,47 @@ New tests: `fuzz` (random coroutine trees mixing every feature, checked against 
 | 15 | **Cancelling a deep chain overflowed the stack** (release_resources -> child release -> ..., and destroy -> owner release -> ...; a 20000-deep cancelable chain crashed, 5000 did not). | Releases are drained iteratively from a thread_local list by the outermost release on a thread. Only objects that hold their owner are queued; owner-less objects (never-started children, roots) are still handled immediately, because a never-started child can be elided into the very frame whose destruction releases it (a first, unconditional version crashed `nested_mix_once` exactly like that). |
 | 16 | **co_spawn from inside a coroutine deadlocked during context destruction.** The destructor waited for `unique_lock` on a `shared_mutex` while the root called `co_spawn` -> `lock_shared()`, which Windows' SRW lock blocks behind the waiting writer. | The holder count is now a plain counter (mutex + condition_variable); `lock()` never blocks. |
 
+## 4d. Structured any_of, timers, detach (the current design)
+
+The HALO bugs in 4a-4c all had one root: an any_of loser (or something holding it) outlived the
+co_await that started it, while its frame sat in a HALO slot that the caller reused. Instead of more
+special cases (`any_of_once`, `any_of_task`, never-elided promises, non-elidable parameters, all now
+removed), the library is now structured:
+
+- `any_of` waits after the winner until every child (with its whole subtree) has been destroyed.
+  Each wrapper gets an `on_destroyed` hook; `destroy()` runs it after destroying the frame and releasing
+  the owner. A counter starting at children + 1 avoids lost wakeups (`wait_children_destroyed`).
+  Everything can be elided again, in loops too.
+- For that not to make any_of slow, waiting must not block threads and must be cancelable: the context
+  has a timer (event loop) and `sleep_for` / `poll_until` / `from_future` / `wait_for_semaphore` are
+  built on it (`delay` awaitable with a `cancel_hook` that removes the timer). A non-cancelable loser
+  still runs to completion and delays any_of (kept on purpose); `detach(task)` opts out.
+- Continuations never hold a strong reference to the coroutine they wake (`schedule_resume`), and the
+  run loop drains `t_next` even when its own job had nothing to resume (fixed a lost wakeup that hung
+  `any_of_vector_fanout`).
+- Windows default timer resolution (~15.6 ms) rounds short delays up (`from_future` polls every 1 ms but
+  takes ~15 ms). A high-resolution waitable timer in `timer_loop` would fix that if needed.
+
+## 4e. Stale resumers: parents now wait for destruction
+
+`any_of_in_loop` still failed ~2/100 after 4d. Instrumentation (a debug map of live promise addresses)
+showed a new any_of promise being constructed on top of the previous iteration's still-alive any_of,
+and, one level down, a finished `sleep_for` still holding strong=1 after its parent's await_resume.
+Cause: thread I runs `sleep_for` into `co_await delay(...)`; the timer fires and thread J resumes and
+finishes it and wakes the parent, which moves on and reuses the HALO slot, while I has not yet returned
+from `resume()` and still holds its strong reference. No ordering on the child side can close that
+window, so the rule became: a parent continues only once the child is destroyed (direct co_await via
+the child's `on_destroyed` hook; all_of and any_of via `wait_children_destroyed`). Combinator children
+use a shared `combinator_sync` block instead of referencing the combinator. With HALO disabled the old
+code never failed (300 runs); with the fix: 0/150, and the overlap detector finds no overlap.
+
+### Verification of the current state (structured design, 30 tests)
+
+Clang 22 -O2, Clang 21 -O2 and MSVC /O2: all tests pass. ASan (Clang 22 -O1): every test individually,
+2 passes, no errors. Fuzz: 20 extra seed batches (24000 random trees). 18 race-sensitive tests x 30
+runs and `any_of_in_loop` x 150: 0 failures. A debug build that aborts when a promise is constructed on
+top of a still-live one: 8 tests x 20 runs, 0 overlaps.
+
 ## 5. Open issues / ideas
 
 - `into_non_throw` of an `ex_task`/`any_of_task` creates a wrapper whose promise carries an unused

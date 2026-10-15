@@ -168,23 +168,15 @@ namespace {
         co_return first_won > 0;
     }
 
-    // any_of_once at the outermost scope: the pinned loser (5 ms) is still running while we go on.
-    task<bool> test_any_of_once_top_level() {
-        auto [fast, slow] = co_await coroutine::any_of_once(coroutine::sleep_for(0ms), coroutine::sleep_for(5ms));
+    // Structured any_of: returns only once the loser is gone; its slot is then reused by the awaits below.
+    task<bool> test_any_of_then_more_awaits() {
+        auto [fast, slow] = co_await coroutine::any_of(coroutine::sleep_for(0ms), coroutine::sleep_for(5ms));
         // One co_await per full expression: a promise awaits at most one child at a time (m_child_handle).
         int sum = co_await value_of(1);
         sum += co_await chain(20);
         co_await coroutine::sleep_for(1ms);
         sum += co_await value_of(2);
         co_return fast.has_value() != slow.has_value() && sum == 23;
-    }
-
-    // NOT safe, kept to demonstrate why any_of_once must not be used in a loop (opt-in test).
-    task<bool> test_any_of_once_in_loop() {
-        for (int i = 0; i < 20; ++i) {
-            co_await coroutine::any_of_once(coroutine::sleep_for(0ms), coroutine::sleep_for(3ms));
-        }
-        co_return true;
     }
 
     // Two co_awaits in one expression. The operands of + are unsequenced, so a compiler may run both
@@ -320,9 +312,9 @@ namespace {
         co_return co_await fuzz_node<task>(seed, depth);
     }
 
-    // any_of_once used as documented: at the outermost scope of the coroutine body.
+    // any_of at the outermost scope of a coroutine body (it used to need any_of_once).
     task<long long> fuzz_any_once(std::uint64_t seed, int depth) {
-        co_await coroutine::any_of_once(fuzz_node<task>(child_seed(seed, 0), depth - 1),
+        co_await coroutine::any_of(fuzz_node<task>(child_seed(seed, 0), depth - 1),
                                         fuzz_node<cancelable_task>(child_seed(seed, 1), depth - 1));
         co_return 300 + leaf_value(seed);
     }
@@ -493,6 +485,44 @@ namespace {
         co_return completed + interrupted == 30;
     }
 
+    // Really blocks a worker thread (cannot be interrupted).
+    task<int> blocking_work(std::atomic<int> *done, int ms) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        done->fetch_add(1);
+        co_return 42;
+    }
+
+    task<bool> test_detach(std::atomic<int> *done) {
+        const int v = co_await coroutine::detach(value_of(5));
+        bool threw = false;
+        try {
+            co_await coroutine::detach(throw_if_negative(-1));
+        } catch (const std::runtime_error &) {
+            threw = true;
+        }
+        // The detached loser must not hold up any_of, even though it blocks a thread for 200 ms.
+        const auto start = std::chrono::steady_clock::now();
+        auto [fast, slow] = co_await coroutine::any_of(coroutine::sleep_for(1ms),
+                                                       coroutine::detach(blocking_work(done, 200)));
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        co_return v == 5 && threw && fast.has_value() && elapsed < 150ms;
+    }
+
+    // A non-cancelable loser that has started runs to completion, and any_of returns only after it has.
+    // (One that has not started yet when the winner finishes is simply dropped: a task pins itself only
+    // once it runs. Hence the delayed winner.)
+    task<int> pinned_loser(std::atomic<int> *finished) {
+        co_await coroutine::sleep_for(20ms);
+        finished->store(1);
+        co_return 2;
+    }
+
+    task<bool> test_any_of_waits_for_pinned_loser() {
+        std::atomic<int> finished{0};
+        auto [fast, slow] = co_await coroutine::any_of(delayed_value(5ms, 1), pinned_loser(&finished));
+        co_return fast.has_value() && **fast == 1 && !slow.has_value() && finished.load() == 1;
+    }
+
     task<bool> test_exceptions() {
         auto [ok, bad] = co_await coroutine::all_of(value_of(1), throw_if_negative(-1));
         bool result = ok.has_value() && *ok == 1 && !bad.has_value();
@@ -523,24 +553,6 @@ namespace {
 
     task<bool> test_nested_mix(std::atomic<int> *completed) {
         co_await do_many_things(14, completed);
-        co_return completed->load() > 0;
-    }
-
-    // Same tree with any_of_once (used at the outermost scope of the coroutine body, so it is safe).
-    cancelable_task<void> do_many_things_once(int n, std::atomic<int> *completed) {
-        if (n < 2) {
-            throw std::runtime_error("leaf");
-        }
-
-        co_await coroutine::any_of_once(do_many_things_once(n - 3, completed), do_many_things_once(n - 2, completed),
-                                        coroutine::any_of_once(do_many_things_once(n - 4, completed),
-                                                               do_many_things_once(n - 3, completed)));
-        co_await coroutine::all_of(do_many_things_once(n - 3, completed), do_many_things_once(n - 4, completed));
-        completed->fetch_add(1);
-    }
-
-    task<bool> test_nested_mix_once(std::atomic<int> *completed) {
-        co_await do_many_things_once(14, completed);
         co_return completed->load() > 0;
     }
 
@@ -702,13 +714,10 @@ int main(int argc, char **argv) {
         // Pinned (non-cancelable) losers keep running after block_on returns and still use `completed`.
         ctx.wait_idle();
     });
-    run("nested_mix_once", 30, [](auto &ctx) {
-        std::atomic<int> completed{0};
-        CHECK(ctx.block_on(test_nested_mix_once(&completed)));
-        ctx.wait_idle();
+    run("any_of_then_more_awaits", 30, [](auto &ctx) { CHECK(ctx.block_on(test_any_of_then_more_awaits())); });
+    run("any_of_waits_for_pinned_loser", 30, [](auto &ctx) {
+        CHECK(ctx.block_on(test_any_of_waits_for_pinned_loser()));
     });
-    run("any_of_once_top_level", 30, [](auto &ctx) { CHECK(ctx.block_on(test_any_of_once_top_level())); });
-    run("unsafe_any_of_once_in_loop", 30, [](auto &ctx) { CHECK(ctx.block_on(test_any_of_once_in_loop())); });
     run("generator", 100, [](auto &ctx) { CHECK(ctx.block_on(test_generator())); });
     run("interrupt", 5, [](auto &ctx) { CHECK(ctx.block_on(test_interrupt())); });
     run("from_future", 100, [](auto &ctx) { CHECK(ctx.block_on(test_from_future())); });
@@ -777,6 +786,14 @@ int main(int argc, char **argv) {
         CHECK(done.load() == 127); // 2^7 - 1 coroutines
     });
     run("interrupt_in_loop", 10, [](auto &ctx) { CHECK(ctx.block_on(test_interrupt_in_loop())); });
+    run("detach", 10, [](auto &) {
+        std::atomic<int> done{0};
+        {
+            coroutine::multithreaded_execution_context local{2, 2};
+            CHECK(local.block_on(test_detach(&done)));
+        } // the destructor waits for the detached task
+        CHECK(done.load() == 1);
+    });
     run("bench_sequential_awaits", 20, [](auto &ctx) { CHECK(ctx.block_on(bench_sequential_awaits(20000))); });
     run("bench_deep_chain", 20, [](auto &ctx) { CHECK(ctx.block_on(bench_deep_chain())); });
     run("cancel_task(original)", 50, [](auto &ctx) {

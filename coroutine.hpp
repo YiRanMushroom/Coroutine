@@ -51,6 +51,7 @@
 #include <format>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <optional>
 #include <semaphore>
@@ -481,24 +482,10 @@ namespace coroutine {
                 m_cancelable = value;
             }
 
-            // Set for coroutines whose frame is known to be on the heap (any_of_task). They do not hold
-            // their owner (see set_owner_if_needed).
-            [[nodiscard]] bool is_never_elided() const noexcept {
-                return m_never_elided;
-            }
-
-            void set_never_elided() noexcept {
-                m_never_elided = true;
-            }
-
-            // The owner reference exists only so that an owner whose frame may contain ours outlives us.
-            // A frame that is never elided is not inside its owner, and must not hold it: it may live on
-            // (any_of losers keep the any_of frame alive) long after the owner has finished, and the owner
-            // may itself be elided into a slot that its parent reuses right after the owner finishes.
-            void set_owner_if_needed(const ref_counted_resource_weak_handle &owner_handle) noexcept {
-                if (!m_never_elided) {
-                    set_owner(owner_handle);
-                }
+            // Called once our frame has been destroyed and our owner released (see destroy). any_of uses
+            // it to wait until every child, with everything below it, is gone.
+            void set_on_destroyed(continuation_type on_destroyed) noexcept {
+                m_on_destroyed = std::move(on_destroyed);
             }
 
             [[nodiscard]] std::coroutine_handle<> get_coroutine_handle() const noexcept {
@@ -539,14 +526,10 @@ namespace coroutine {
             // Set by final_awaiter, consumed by the resumer (see `resume_and_finish`) on the same thread.
             inline static thread_local finished_work t_finished_work{};
 
-            // The continuation (which usually resumes the parent) must not run from in here.
-            //
-            // With HALO our frame may be a slot inside the parent's frame, and the parent may reuse that
-            // slot for its next child as soon as it is resumed (e.g. `for (...) co_await child();`). So by
-            // the time the parent runs, nothing on our side may still touch our frame: the pin and the
-            // resumer's strong reference must already be gone, leaving the parent as the last owner, who
-            // destroys us inside await_resume. Hence we only hand the work over here; the resumer runs it
-            // after `resume()` has returned and it has released its own reference.
+            // Finishing is handed over to the resumer (resume_and_finish) instead of running here: the
+            // continuation may make our parent move on, and the resumer runs it once the coroutine has
+            // fully suspended and `resume()` has returned, so nothing of ours is still executing then.
+            // (Parents wait for our destruction, not for this, before they reuse our HALO slot.)
             struct final_awaiter : std::suspend_always {
                 promise_base *m_promise;
 
@@ -569,12 +552,15 @@ namespace coroutine {
                 // Do not inspect the coroutine here (e.g. handle.done()): if it suspended at a co_await, it
                 // may already have been handed to, and resumed by, another thread.
 
+                // The continuation runs while we still hold the coroutine, so it can read the result. That
+                // our references outlive it is harmless: whoever waits for this coroutine waits for its
+                // destruction (see task_base::by_promise and wait_children_destroyed).
                 auto work = std::exchange(t_finished_work, {});
-                strong.reset();
-                work.pin.reset();
                 if (work.continuation) {
                     work.continuation();
                 }
+                work.pin.reset();
+                strong.reset();
             }
 
             final_awaiter final_suspend() noexcept {
@@ -599,57 +585,92 @@ namespace coroutine {
                 g_promise_count.fetch_sub(1, std::memory_order_release);
             }
 
-            // A child being awaited. The node lives in the awaiter (inside our frame) and is linked into
-            // m_awaited_children from await_suspend until await_resume. Usually there is one; there can
+        public:
+            // Something this coroutine is suspended on that must be let go of if it is cancelled: a child
+            // it awaits (awaited_child) or a timer (delay). The node lives in the awaiter, inside our
+            // frame, and is linked from await_suspend until await_resume. Usually there is one; there can
             // be several when one expression has several co_awaits (`co_await a() + co_await b()`): the
             // operands are unsequenced, and MSVC suspends for b before running a's await_resume.
-            struct awaited_child {
+            struct cancel_hook {
+                cancel_hook *next = nullptr;
+
+                virtual void on_cancel() noexcept = 0;
+
+            protected:
+                ~cancel_hook() = default;
+            };
+
+            // A child being awaited: cancelling us releases it. It is also released once it has finished
+            // (by its continuation, on the child's thread); the flag makes sure only one of the two does.
+            struct awaited_child final : cancel_hook {
                 ref_counted_resource_handle child;
-                awaited_child *next = nullptr;
+                std::atomic_bool released{false};
+
+                explicit awaited_child(ref_counted_resource_handle handle) noexcept : child(std::move(handle)) {
+                }
+
+                void release_child() noexcept {
+                    if (!released.exchange(true, std::memory_order_acq_rel)) {
+                        child.reset();
+                    }
+                }
+
+                void on_cancel() noexcept override {
+                    release_child();
+                }
             };
 
             // Both only run while this coroutine is running (await_suspend before the hand-off,
             // await_resume after resumption), so they never race with each other or with
             // release_resources, which only runs once nobody can resume us any more.
-            void link_awaited_child(awaited_child *node) noexcept {
-                node->next = std::exchange(m_awaited_children, node);
+            void link_cancel_hook(cancel_hook *node) noexcept {
+                node->next = std::exchange(m_cancel_hooks, node);
             }
 
-            void unlink_awaited_child(awaited_child *node) noexcept {
-                for (auto **link = &m_awaited_children; *link; link = &(*link)->next) {
+            void unlink_cancel_hook(cancel_hook *node) noexcept {
+                for (auto **link = &m_cancel_hooks; *link; link = &(*link)->next) {
                     if (*link == node) {
                         *link = node->next;
                         return;
                     }
                 }
-                assert(false && "awaited child is not linked");
+                assert(false && "cancel hook is not linked");
             }
 
-            // Last strong reference gone: cancel the children we are awaiting. Our frame cannot be destroyed
-            // during the walk: the strong references' weak reference is only released after we return.
+        protected:
+            // Last strong reference gone: let go of whatever we are suspended on. Our frame cannot be
+            // destroyed during the walk: the strong references' weak reference is only released after we
+            // return.
             void release_resources() noexcept override {
-                for (auto *node = m_awaited_children; node; node = node->next) {
-                    node->child.reset();
+                for (auto *node = m_cancel_hooks; node; node = node->next) {
+                    node->on_cancel();
                 }
             }
 
-            // Last weak reference gone: destroy the frame, then let go of the owner. The owner must be
-            // released *after* the frame, because with HALO our frame may live inside the owner's.
+            // Last weak reference gone: destroy the frame, then let go of the owner, then tell whoever
+            // waits for us. The owner must be released *after* the frame, because with HALO our frame may
+            // live inside the owner's; and before the notification, because the notified coroutine may
+            // finish and have its own slot reused right away.
             void destroy() noexcept override {
                 auto owner = std::move(m_owner_handle);
+                auto on_destroyed = std::move(m_on_destroyed);
                 m_continuation = nullptr;
                 m_coroutine_handle.destroy();
+                owner.reset();
+                if (on_destroyed) {
+                    on_destroyed();
+                }
             }
 
             continuation_type m_continuation;
+            continuation_type m_on_destroyed;
             ref_counted_resource_weak_handle m_owner_handle{};
             ref_counted_resource_handle m_self_handle{}; // pins a non-cancelable task while awaited
-            awaited_child *m_awaited_children = nullptr; // the tasks we are currently awaiting
+            cancel_hook *m_cancel_hooks = nullptr; // what we are currently suspended on
             execution_context *m_execution_context = nullptr;
             std::coroutine_handle<> m_coroutine_handle = nullptr;
             task_hint m_task_hint{e_none};
             bool m_cancelable = false;
-            bool m_never_elided = false;
         };
     }
 
@@ -686,6 +707,24 @@ namespace coroutine {
 
         // Starts `coroutine` detached; the context's destructor waits for it to finish.
         virtual void co_spawn(_details::task_base<void> coroutine) = 0;
+
+        // ---- timers: the event-loop part of a context ----
+
+        struct timer_id {
+            std::chrono::steady_clock::time_point deadline;
+            std::uint64_t sequence;
+
+            auto operator<=>(const timer_id &) const = default;
+        };
+
+        // Resumes `coroutine` (unless it has been cancelled by then) once `deadline` has passed. The id is
+        // written to `id` before the timer can fire: the caller is suspending and must not touch its
+        // awaiter after this call returns (see the hand-off rule).
+        virtual void add_timer(std::chrono::steady_clock::time_point deadline,
+                               _details::ref_counted_resource_weak_handle coroutine, timer_id &id) = 0;
+
+        // Removes a timer that has not fired yet; does nothing if it already has.
+        virtual void cancel_timer(const timer_id &id) noexcept = 0;
 
         // RAII holder of the shared lock above.
         struct context_lock_holder_type {
@@ -744,6 +783,19 @@ namespace coroutine {
     }
 
     namespace _details {
+        // Schedules the coroutine behind `weak` and keeps no reference to it at all: the reference is
+        // handed over to the scheduler. Every continuation that wakes a parent goes through here. Holding
+        // on to the parent (e.g. `if (auto p = weak.lock()) resume(p);`) would keep it alive while it
+        // runs on another thread; if it finished and its own parent continued, that parent could reuse
+        // its HALO slot while we still referred to it. A cancelled coroutine is not resumed: the
+        // scheduler's lock() fails.
+        inline void schedule_resume(ref_counted_resource_weak_handle weak) {
+            auto *promise = static_cast<promise_base *>(weak.get_raw()); // the weak reference keeps the memory
+            promise->get_execution_context()->resume_promise_weak(std::move(weak));
+        }
+    }
+
+    namespace _details {
         // -----------------------------------------------------------------------------------------
         // promise<T>: stores the result
         // -----------------------------------------------------------------------------------------
@@ -762,6 +814,27 @@ namespace coroutine {
         class promise : public promise_base {
         public:
             using value_type = T;
+            using result_variant = std::variant<not_finished, finished<T>, uncaught_exception>;
+
+            // Moves the outcome out (used by the awaiter of a direct co_await, see task_base::by_promise).
+            result_variant take_result() noexcept {
+                return std::move(m_result);
+            }
+
+            // The value of an outcome taken with take_result, or its exception rethrown.
+            static T unwrap(result_variant &&result) {
+                return std::visit(overloaded{
+                                      [](not_finished &) -> T {
+                                          throw std::runtime_error("Result not set.");
+                                      },
+                                      [](finished<T> &value) -> T {
+                                          return std::move(value);
+                                      },
+                                      [](uncaught_exception &e) -> T {
+                                          std::rethrow_exception(e);
+                                      }
+                                  }, result);
+            }
 
             T get_result_copy() const {
                 return std::visit(overloaded{
@@ -808,6 +881,24 @@ namespace coroutine {
         class promise<void> : public promise_base {
         public:
             using value_type = void;
+            using result_variant = std::variant<not_finished, finished<void>, uncaught_exception>;
+
+            result_variant take_result() noexcept {
+                return std::move(m_result);
+            }
+
+            static void unwrap(result_variant &&result) {
+                std::visit(overloaded{
+                               [](not_finished &) {
+                                   throw std::runtime_error("Result not set.");
+                               },
+                               [](finished<void> &) {
+                               },
+                               [](uncaught_exception &e) {
+                                   std::rethrow_exception(e);
+                               }
+                           }, result);
+            }
 
             void get_result_copy() const {
                 std::visit(overloaded{
@@ -919,13 +1010,18 @@ namespace coroutine {
                 return checked_promise()->get_result_move();
             }
 
-            // The awaiter owns the child (strongly). It pins the child and makes it visible to the parent's
-            // release_resources only in await_suspend, and hides it again in await_resume:
-            //   * if the co_await expression is abandoned before suspending (an exception in another
-            //     operand), the awaiter just drops its child, which never started;
-            //   * several co_awaits of one expression may be in flight at once (see awaited_child).
-            // Cancellation is not delayed: before await_suspend the parent is running, so it cannot be
-            // cancelled anyway.
+            // `co_await task` inside one of our coroutines.
+            //
+            // The parent continues only once the child has been *destroyed*, not merely finished: with HALO
+            // the child's frame is a slot in the parent's frame, reused as soon as the parent moves on, and a
+            // finished child can still be referenced for a while (e.g. by a thread that resumed it earlier
+            // and has not returned from resume() yet). So: when the child finishes, its continuation moves
+            // the result into this awaiter and releases the parent's reference to the child; the child's
+            // on_destroyed hook then resumes the parent.
+            //
+            // The awaiter owns the child until await_suspend; only then is the child pinned and made visible
+            // to the parent's release_resources (cancel_hook). If the co_await expression is abandoned before
+            // it suspends (an exception in another operand), the awaiter just drops its unstarted child.
             auto by_promise(promise_base *parent_promise) && {
                 assert(parent_promise);
                 checked_promise();
@@ -933,6 +1029,7 @@ namespace coroutine {
                 struct awaiter {
                     promise_base *m_parent_promise;
                     promise_base::awaited_child m_node;
+                    typename promise_type::result_variant m_result{};
 
                     [[nodiscard]] constexpr static bool await_ready() noexcept {
                         return false;
@@ -942,39 +1039,38 @@ namespace coroutine {
                         execution_context *context = m_parent_promise->get_execution_context();
                         assert(context);
 
-                        auto *child = static_cast<promise_base *>(m_node.child.get());
+                        auto *child = static_cast<promise_type *>(m_node.child.get());
                         if (!child->is_cancelable()) {
                             child->m_self_handle = child->borrow(); // run to completion even if the parent is cancelled
                         }
-                        m_parent_promise->link_awaited_child(&m_node);
+                        m_parent_promise->link_cancel_hook(&m_node);
 
                         if (!child->get_execution_context()) {
                             child->set_execution_context(context);
                         }
 
-                        auto weak_parent = m_parent_promise->weak_borrow();
-                        child->set_owner_if_needed(weak_parent);
-                        child->set_continuation([weak_parent = std::move(weak_parent)]() {
-                            if (auto parent = weak_parent.lock()) {
-                                auto *p = static_cast<promise_base *>(parent.get());
-                                p->get_execution_context()->resume_promise(p);
-                            }
+                        child->set_owner(m_parent_promise->weak_borrow());
+                        // Runs on the child's thread when it finishes, while the child is still referenced
+                        // by its finisher. Our frame stays allocated: the child holds it as its owner.
+                        child->set_continuation([this, child] {
+                            m_result = child->take_result();
+                            m_node.release_child();
+                        });
+                        child->set_on_destroyed([weak_parent = m_parent_promise->weak_borrow()]() mutable {
+                            schedule_resume(std::move(weak_parent));
                         });
 
                         child->get_execution_context()->resume_promise(child);
-                        // Hand-off: the child may already have finished and resumed the parent.
+                        // Hand-off: the child may already have finished, been destroyed and resumed us.
                     }
 
                     auto await_resume() {
-                        m_parent_promise->unlink_awaited_child(&m_node);
-                        // Releasing the child here (usually the last reference) destroys it before we
-                        // continue, so its HALO slot is free before we can reuse it.
-                        auto child = std::move(m_node.child);
-                        return static_cast<promise_type *>(child.get())->get_result_move();
+                        m_parent_promise->unlink_cancel_hook(&m_node);
+                        return promise_type::unwrap(std::move(m_result));
                     }
                 };
 
-                return awaiter{parent_promise, {std::move(this->m_coroutine_handle)}};
+                return awaiter{parent_promise, promise_base::awaited_child{std::move(this->m_coroutine_handle)}};
             }
 
             // Used only when a task is awaited by a coroutine whose promise is not a promise_base.
@@ -1128,6 +1224,150 @@ namespace coroutine {
         }
 
         // -----------------------------------------------------------------------------------------
+        // Waiting without blocking a thread
+        // -----------------------------------------------------------------------------------------
+
+        // `co_await delay(d)` suspends the coroutine for `d` using the context's timer; no thread is
+        // occupied meanwhile. If the coroutine is cancelled while it waits, the timer is removed, so the
+        // coroutine can be destroyed right away instead of when the timer would have fired.
+        struct delay_type : abstract_awaitable_base {
+            std::chrono::steady_clock::duration m_duration;
+
+            struct awaiter final : promise_base::cancel_hook {
+                promise_base *m_promise;
+                std::chrono::steady_clock::duration m_duration;
+                execution_context::timer_id m_timer{};
+
+                awaiter(promise_base *promise, std::chrono::steady_clock::duration duration) noexcept
+                    : m_promise(promise), m_duration(duration) {
+                }
+
+                [[nodiscard]] bool await_ready() const noexcept {
+                    return m_duration <= std::chrono::steady_clock::duration::zero();
+                }
+
+                void await_suspend(std::coroutine_handle<>) noexcept {
+                    execution_context *context = m_promise->get_execution_context();
+                    assert(context);
+                    m_promise->link_cancel_hook(this);
+                    context->add_timer(std::chrono::steady_clock::now() + m_duration, m_promise->weak_borrow(),
+                                       m_timer);
+                    // Hand-off: the timer may already have fired and resumed us on another thread.
+                }
+
+                void await_resume() noexcept {
+                    if (!await_ready()) { // only linked if we actually suspended
+                        m_promise->unlink_cancel_hook(this);
+                    }
+                }
+
+                void on_cancel() noexcept override {
+                    m_promise->get_execution_context()->cancel_timer(m_timer);
+                }
+            };
+
+            [[nodiscard]] awaiter by_promise(promise_base *promise) const {
+                return {promise, m_duration};
+            }
+        };
+
+        inline delay_type delay(std::chrono::steady_clock::duration duration) {
+            return {{}, duration};
+        }
+
+        // Waits until `ready()` returns true, checking it every `interval`. Between checks the coroutine is
+        // suspended (no thread is blocked), so it can be cancelled at once. Use it to turn something that
+        // would block (a std::future, a semaphore, ...) into something that can be interrupted.
+        template<typename Predicate>
+        cancelable_task<void> poll_until(Predicate ready,
+                                         std::chrono::steady_clock::duration interval = std::chrono::milliseconds(1)) {
+            while (!ready()) {
+                co_await delay(interval);
+            }
+        }
+
+        // -----------------------------------------------------------------------------------------
+        // detach: run a task in the background
+        // -----------------------------------------------------------------------------------------
+
+        // Where a detached task finds the coroutine waiting for it. Shared (not a reference to the waiter
+        // held by the task), so that cancelling the waiter can cut the link: the waiter can then be
+        // destroyed at once instead of when the detached task finishes.
+        struct detach_link {
+            std::mutex mutex;
+            ref_counted_resource_weak_handle waiter;
+        };
+
+        struct detach_awaiter final : promise_base::cancel_hook {
+            promise_base *m_waiter;
+            ref_counted_resource_handle m_task; // a second reference; the waiter keeps its own for the result
+            std::shared_ptr<detach_link> m_link = std::make_shared<detach_link>();
+
+            detach_awaiter(promise_base *waiter, ref_counted_resource_handle task) noexcept
+                : m_waiter(waiter), m_task(std::move(task)) {
+            }
+
+            [[nodiscard]] constexpr static bool await_ready() noexcept {
+                return false;
+            }
+
+            void await_suspend(std::coroutine_handle<>) {
+                execution_context *context = m_waiter->get_execution_context();
+                assert(context);
+                auto *task = static_cast<promise_base *>(m_task.get());
+                if (!task->get_execution_context()) {
+                    task->set_execution_context(context);
+                }
+
+                m_link->waiter = m_waiter->weak_borrow();
+                m_waiter->link_cancel_hook(this);
+
+                // Like co_spawn: the task pins itself and keeps the context alive until it finishes. It has
+                // no owner; its frame is on the heap (detach's parameter is not elidable).
+                task->set_continuation([context_lock = context->lock_this(), self = task->borrow(),
+                                        link = m_link] {
+                    ref_counted_resource_weak_handle waiter;
+                    {
+                        std::lock_guard guard(link->mutex);
+                        waiter = std::move(link->waiter);
+                    }
+                    if (!waiter.is_null()) {
+                        schedule_resume(std::move(waiter));
+                    }
+                });
+                context->resume_promise_strong(std::move(m_task));
+                // Hand-off: the task may already have finished and resumed us.
+            }
+
+            void await_resume() noexcept {
+                m_waiter->unlink_cancel_hook(this);
+            }
+
+            void on_cancel() noexcept override {
+                std::lock_guard guard(m_link->mutex);
+                m_link->waiter.reset(); // the task no longer refers to us; it keeps running
+            }
+        };
+
+        struct detach_start : abstract_awaitable_base {
+            ref_counted_resource_handle m_task;
+
+            detach_awaiter by_promise(promise_base *waiter) && {
+                return {waiter, std::move(m_task)};
+            }
+        };
+
+        // Runs `task` in the background, like co_spawn, and returns a cancelable task for its result.
+        // Cancelling (or dropping) the returned task does not cancel `task` and does not wait for it: use
+        // this for blocking work that must not hold up an any_of / interrupt_by. The context's destructor
+        // still waits for `task` to finish.
+        template<template<typename> typename TaskType, typename T>
+        cancelable_task<T> detach(TaskType<T> task) {
+            co_await detach_start{{}, task.get_coroutine_handle()};
+            co_return std::move(task).get_result();
+        }
+
+        // -----------------------------------------------------------------------------------------
         // multithreaded_execution_context
         // -----------------------------------------------------------------------------------------
 
@@ -1141,12 +1381,14 @@ namespace coroutine {
                 : m_thread_pool(std::make_unique<dp_thread_pool::thread_pool<>>(
                       thread_count, [this](std::size_t) { t_worker = {this, false}; })),
                   m_io_thread_pool(std::make_unique<dp_thread_pool::thread_pool<>>(
-                      io_thread_count, [this](std::size_t) { t_worker = {this, true}; })) {
+                      io_thread_count, [this](std::size_t) { t_worker = {this, true}; })),
+                  m_timer_thread([this](std::stop_token stop) { timer_loop(stop); }) {
             }
 
             // Waits for every spawned coroutine, then for everything they left behind (e.g. pinned
-            // tasks that are still finishing after their parent was cancelled). Only then are the
-            // pools destroyed, so no job can enqueue into a pool that is already gone.
+            // tasks that are still finishing after their parent was cancelled, pending timers). Only
+            // then are the timer thread and the pools destroyed, so nothing can enqueue into a pool that
+            // is already gone.
             ~multithreaded_execution_context() override {
                 {
                     std::unique_lock lock(m_holders_mutex);
@@ -1209,6 +1451,33 @@ namespace coroutine {
                 }
             }
 
+            void add_timer(std::chrono::steady_clock::time_point deadline,
+                           ref_counted_resource_weak_handle coroutine, timer_id &id) override {
+                m_pending_jobs.fetch_add(1, std::memory_order_relaxed); // a pending timer is pending work
+                std::lock_guard guard(m_timer_mutex);
+                id = {deadline, m_next_timer_sequence++};
+                const bool earliest = m_timers.empty() || id < m_timers.begin()->first;
+                m_timers.emplace(id, std::move(coroutine));
+                if (earliest) {
+                    m_timer_changed.notify_one();
+                }
+            }
+
+            void cancel_timer(const timer_id &id) noexcept override {
+                ref_counted_resource_weak_handle coroutine;
+                {
+                    std::lock_guard guard(m_timer_mutex);
+                    const auto it = m_timers.find(id);
+                    if (it == m_timers.end()) {
+                        return; // already fired; the resumption will find the coroutine cancelled
+                    }
+                    coroutine = std::move(it->second);
+                    m_timers.erase(it);
+                }
+                coroutine.reset();
+                job_finished();
+            }
+
             void co_spawn(task_base<void> coroutine) override {
                 promise_base *promise = coroutine.get_promise();
                 assert(promise);
@@ -1239,9 +1508,18 @@ namespace coroutine {
             // nested resume() calls, so the stack depth stays constant however long the chain is. Each
             // coroutine is resumed only after resume_and_finish has returned for the previous one, i.e.
             // after the previous one released its references (see final_awaiter).
+            //
+            // t_next is checked even when there is nothing to resume: releasing a reference (e.g. the weak
+            // one of a job whose coroutine was cancelled) can destroy a coroutine, and that can schedule
+            // another one (an any_of waiting for its children to be gone) into t_next.
             static void run_on_this_thread(ref_counted_resource_handle strong) {
-                while (strong) {
-                    promise_base::resume_and_finish(std::move(strong));
+                for (;;) {
+                    if (strong) {
+                        promise_base::resume_and_finish(std::move(strong));
+                    }
+                    if (t_next.is_null()) {
+                        return;
+                    }
                     strong = std::exchange(t_next, {}).lock();
                 }
             }
@@ -1255,15 +1533,43 @@ namespace coroutine {
                         multithreaded_execution_context *self;
 
                         ~job_done() {
-                            // Jobs enqueued by `job` were counted before this decrement, so the count only
-                            // reaches zero when everything has finished.
-                            if (self->m_pending_jobs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                                self->m_pending_jobs.notify_all();
-                            }
+                            self->job_finished();
                         }
                     } done{this};
                     std::move(job)();
                 });
+            }
+
+            // Jobs and timers started by a job were counted before the job itself finishes, so the count
+            // only reaches zero once everything has finished.
+            void job_finished() noexcept {
+                if (m_pending_jobs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    m_pending_jobs.notify_all();
+                }
+            }
+
+            // Fires timers in deadline order. Sleeps until the earliest deadline, or until an earlier timer
+            // is added or the earliest one is cancelled.
+            void timer_loop(std::stop_token stop) {
+                std::unique_lock lock(m_timer_mutex);
+                while (!stop.stop_requested()) {
+                    if (m_timers.empty()) {
+                        m_timer_changed.wait(lock, stop, [this] { return !m_timers.empty(); });
+                        continue;
+                    }
+                    const timer_id earliest = m_timers.begin()->first;
+                    if (std::chrono::steady_clock::now() < earliest.deadline) {
+                        m_timer_changed.wait_until(lock, stop, earliest.deadline, [this, earliest] {
+                            return m_timers.empty() || m_timers.begin()->first != earliest;
+                        });
+                        continue;
+                    }
+                    auto node = m_timers.extract(m_timers.begin());
+                    lock.unlock();
+                    resume_promise_weak(std::move(node.mapped())); // counted as a job of its own
+                    job_finished(); // the timer itself
+                    lock.lock();
+                }
             }
 
             // Declared first so it is destroyed last: a worker may still be inside notify_all() when
@@ -1274,6 +1580,13 @@ namespace coroutine {
             std::mutex m_holders_mutex;
             std::condition_variable m_holders_changed;
             std::size_t m_holders = 0; // co_spawn'ed roots that have not finished, plus explicit lock()s
+
+            std::mutex m_timer_mutex;
+            std::condition_variable_any m_timer_changed;
+            std::map<timer_id, ref_counted_resource_weak_handle> m_timers;
+            std::uint64_t m_next_timer_sequence = 0;
+            // Declared last so it is destroyed (stopped and joined) first, while the pools still exist.
+            std::jthread m_timer_thread;
         };
     }
 
@@ -1477,20 +1790,39 @@ namespace coroutine {
             return promise;
         }
 
+        // The meeting point between a combinator (all_of / any_of) and its children. The children's
+        // continuations and on_destroyed hooks refer to this small heap block, never to the combinator's
+        // frame: a child that is still finishing its continuation after the combinator has been woken
+        // would otherwise keep the combinator's frame alive while the combinator finishes and its caller
+        // reuses its HALO slot. Only `waiter` refers to the combinator. It is set by the combinator just
+        // before it suspends and moved out (handed to the scheduler, see schedule_resume) by whoever
+        // wakes it, so once the combinator runs again nothing refers to it from here.
+        struct combinator_sync {
+            std::atomic_size_t pending{0}; // all_of: children not finished yet
+            std::atomic_bool finished{false}; // any_of: the winner has been chosen
+            std::size_t winner = 0; // any_of: published to the combinator by its resumption
+            std::atomic_size_t alive{0}; // children not destroyed yet + 1, see wait_children_destroyed
+            ref_counted_resource_weak_handle waiter;
+
+            void wake() {
+                schedule_resume(std::move(waiter));
+            }
+        };
+
         // Makes every element of `children` a child of `parent` and starts them. Called from the
-        // parent's await_suspend. `make_continuation(index, weak_parent)` returns the continuation
-        // that child `index` calls when it finishes; one of them eventually resumes the parent.
+        // parent's await_suspend. `make_continuation(index)` returns the continuation that child `index`
+        // calls when it finishes; one of them eventually wakes the parent.
         //
         // The children are started in a second pass, after a weak reference to each has been taken.
-        // Once the first child starts, the parent may be resumed on another thread (any_of resumes
-        // on the first finished child) and release children that we have not started yet. Thanks to
-        // the weak references their memory stays valid; their scheduled resumption then fails to
-        // lock() and they never run, which is exactly the any_of cancellation semantics.
+        // Once the first child starts, the parent may be resumed on another thread (any_of resumes on the
+        // first finished child) and release children that we have not started yet. Thanks to the weak
+        // references their memory stays valid; their scheduled resumption then fails to lock() and they
+        // never run, which is exactly the any_of cancellation semantics. The second pass holds no
+        // reference to the parent at all.
         template<typename Children, typename MakeContinuation>
         void start_children(promise_base *parent, Children &children, MakeContinuation &&make_continuation) {
             execution_context *context = parent->get_execution_context();
             assert(context);
-            auto weak_parent = parent->weak_borrow();
 
             using weak_handle = ref_counted_resource_weak_handle;
             using started_type = decltype([] {
@@ -1511,8 +1843,8 @@ namespace coroutine {
                 if (!child->get_execution_context()) {
                     child->set_execution_context(context);
                 }
-                child->set_owner_if_needed(weak_parent);
-                child->set_continuation(make_continuation(index, weak_parent));
+                child->set_owner(parent->weak_borrow());
+                child->set_continuation(make_continuation(index));
                 started[index] = child->weak_borrow();
                 ++index;
             }
@@ -1523,31 +1855,88 @@ namespace coroutine {
             }
         }
 
-        // Continuation for all_of: the last child to finish resumes the parent.
-        template<typename PromiseType>
-        auto all_of_continuation(ref_counted_resource_weak_handle weak_parent) {
-            return [weak_parent = std::move(weak_parent)]() {
-                if (auto parent = weak_parent.lock()) {
-                    auto *p = static_cast<PromiseType *>(parent.get());
-                    if (p->state.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                        p->get_execution_context()->resume_promise(p);
-                    }
+        // all_of: the last child to finish wakes the combinator.
+        inline auto all_of_continuation(std::shared_ptr<combinator_sync> sync) {
+            return [sync = std::move(sync)] {
+                if (sync->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    sync->wake();
                 }
             };
         }
 
-        // Continuation for any_of: the first child to finish records its index and resumes the parent.
-        template<typename PromiseType>
-        auto any_of_continuation(std::size_t index, ref_counted_resource_weak_handle weak_parent) {
-            return [index, weak_parent = std::move(weak_parent)]() {
-                if (auto parent = weak_parent.lock()) {
-                    auto *p = static_cast<PromiseType *>(parent.get());
-                    if (!p->state.finished.exchange(true, std::memory_order_acq_rel)) {
-                        p->state.winner = index; // published to the parent by its resumption
-                        p->get_execution_context()->resume_promise(p);
-                    }
+        // any_of: the first child to finish records its index and wakes the combinator.
+        inline auto any_of_continuation(std::size_t index, std::shared_ptr<combinator_sync> sync) {
+            return [index, sync = std::move(sync)] {
+                if (!sync->finished.exchange(true, std::memory_order_acq_rel)) {
+                    sync->winner = index;
+                    sync->wake();
                 }
             };
+        }
+
+        // Structured combinators: once all_of has its results (any_of its winner), it releases its children
+        // and then waits until every one of them has been destroyed, together with everything below it (a
+        // child is only destroyed after its own children, which hold it as their owner). Nothing a
+        // combinator started outlives it, so all of it may live in HALO slots of the caller.
+        //
+        // `alive` starts at (number of children + 1): each child's on_destroyed hook takes one, and the
+        // combinator takes the last one when it suspends here. Whoever takes the last one wakes it, so a
+        // child destroyed before the combinator gets here (e.g. while it releases them) cannot be missed.
+        inline auto on_child_destroyed(std::shared_ptr<combinator_sync> sync) {
+            return [sync = std::move(sync)] {
+                if (sync->alive.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    sync->wake();
+                }
+            };
+        }
+
+        struct wait_children_destroyed {
+            combinator_sync *sync;
+            promise_base *self;
+
+            [[nodiscard]] constexpr static bool await_ready() noexcept {
+                return false;
+            }
+
+            // Returning false resumes us at once: every child was already gone.
+            [[nodiscard]] bool await_suspend(std::coroutine_handle<>) const noexcept {
+                sync->waiter = self->weak_borrow();
+                if (sync->alive.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    sync->waiter.reset();
+                    return false;
+                }
+                return true; // hand-off: the last hook may already be waking us
+            }
+
+            constexpr static void await_resume() noexcept {
+            }
+        };
+
+        // Starts the children of an any_of (tuple or vector of tasks) with its sync block.
+        template<typename Children>
+        void start_any_of_children(promise_base *promise, Children &children,
+                                   const std::shared_ptr<combinator_sync> &sync) {
+            sync->waiter = promise->weak_borrow(); // woken by the winner
+            for (auto &child: children) {
+                promise_of(child)->set_on_destroyed(on_child_destroyed(sync));
+            }
+            start_children(promise, children, [&sync](std::size_t index) {
+                return any_of_continuation(index, sync);
+            });
+        }
+
+        // Starts the children of an all_of (tuple or vector of tasks) with its sync block.
+        template<typename Children>
+        void start_all_of_children(promise_base *promise, Children &children,
+                                   const std::shared_ptr<combinator_sync> &sync) {
+            sync->pending.store(std::size(children), std::memory_order_relaxed);
+            sync->waiter = promise->weak_borrow(); // woken by the last child to finish
+            for (auto &child: children) {
+                promise_of(child)->set_on_destroyed(on_child_destroyed(sync));
+            }
+            start_children(promise, children, [&sync](std::size_t) {
+                return all_of_continuation(sync);
+            });
         }
 
         // -----------------------------------------------------------------------------------------
@@ -1560,16 +1949,16 @@ namespace coroutine {
 
         template<typename... T>
         struct all_of_args_shared_state {
-            std::atomic_size_t remaining{sizeof...(T)};
+            std::shared_ptr<combinator_sync> sync = std::make_shared<combinator_sync>();
             std::tuple<non_throw_task<T>...> children;
 
             // Called (through ex_promise) when the combinator is cancelled while its children run: release
-            // them, which cancels the cancelable ones. Without this the children, which hold our frame
-            // weakly, and the frame, which holds them strongly here, would keep each other alive forever.
-            // Safe: everything else that touches `children` either holds a strong reference to us or
-            // only does so after a successful lock().
+            // them, which cancels the cancelable ones, and let go of the sync block, whose `waiter` may
+            // refer to us. Without this the children, which hold our frame weakly, and the frame, which
+            // holds them strongly here, would keep each other alive forever.
             void release_resources() noexcept {
                 children = decltype(children){};
+                sync.reset();
             }
         };
 
@@ -1588,6 +1977,13 @@ namespace coroutine {
             });
         }
 
+        template<typename... Tasks>
+        std::array<promise_base *, sizeof...(Tasks)> promises_of(std::tuple<Tasks...> &children) {
+            return std::apply([](auto &... child) {
+                return std::array<promise_base *, sizeof...(Tasks)>{child.get_promise()...};
+            }, children);
+        }
+
         // Waits for all tasks. Never throws; each element holds the value or the exception of one task.
         template<typename... Tasks> requires (sizeof...(Tasks) > 0)
         ex_task<std::tuple<result_or_exception<typename Tasks::value_type>...>,
@@ -1596,7 +1992,6 @@ namespace coroutine {
             using result_type = std::tuple<result_or_exception<typename Tasks::value_type>...>;
             using state_type = all_of_args_shared_state<typename Tasks::value_type...>;
             using promise_type = ex_promise<result_type, state_type>;
-            constexpr std::size_t count = sizeof...(Tasks);
 
             auto *promise = static_cast<promise_type *>(co_await get_current_promise());
             state_type *state = &promise->state;
@@ -1606,13 +2001,11 @@ namespace coroutine {
                 co_await force_await_embed_in_current_frame(into_non_throw(std::move(tasks)))...);
             assign_contexts(state->children, contexts);
 
+            state->sync->alive.store(sizeof...(Tasks) + 1, std::memory_order_relaxed);
+
             co_await suspend_and_then([promise](std::coroutine_handle<>) {
-                auto children = std::apply([](auto &... child) {
-                    return std::array<promise_base *, count>{child.get_promise()...};
-                }, promise->state.children);
-                start_children(promise, children, [](std::size_t, ref_counted_resource_weak_handle weak_parent) {
-                    return all_of_continuation<promise_type>(std::move(weak_parent));
-                });
+                auto children = promises_of(promise->state.children);
+                start_all_of_children(promise, children, promise->state.sync);
             });
 
             // Every child has finished.
@@ -1620,66 +2013,32 @@ namespace coroutine {
                 return result_type{child.get_promise()->get_result_move()...};
             }, state->children);
             state->children = {};
+            co_await wait_children_destroyed{state->sync.get(), promise};
             co_return results;
         }
 
         template<typename... T>
         struct any_of_args_shared_state {
-            std::atomic_bool finished{false};
-            std::size_t winner = 0;
+            std::shared_ptr<combinator_sync> sync = std::make_shared<combinator_sync>();
             std::tuple<non_throw_task<T>...> children;
 
-            // Called (through ex_promise) when the combinator is cancelled while its children run: release
-            // them, which cancels the cancelable ones. Without this the children, which hold our frame
-            // weakly, and the frame, which holds them strongly here, would keep each other alive forever.
-            // Safe: everything else that touches `children` either holds a strong reference to us or
-            // only does so after a successful lock().
+            // Called (through ex_promise) when any_of is cancelled while its children run: release them,
+            // which cancels the cancelable ones, and let go of the sync block, whose `waiter` may refer
+            // to us (otherwise: frame -> sync -> frame).
             void release_resources() noexcept {
                 children = decltype(children){};
+                sync.reset();
             }
         };
 
-        // The task type returned by `any_of`: an ex_task *without* COROUTINE_AWAIT_ELIDABLE.
-        //
-        // any_of resumes its caller as soon as the first child finishes, while the losers keep running
-        // until they finish (non-cancelable) or reach their next suspension point (cancelable). Every
-        // loser holds its owners weakly, so the owners' frames stay allocated, but if an owner's frame
-        // were a HALO slot of the caller's frame, the caller could reuse that slot for its next child
-        // (e.g. on the next loop iteration) while the loser still uses it. So neither the any_of frame
-        // nor the children may be elided into the caller.
-        template<typename T, typename S>
-        class any_of_task : public task_base<T> {
-        public:
-            using promise_type = ex_promise<T, S>;
-            using typename task_base<T>::value_type;
-
-            any_of_task() = default;
-
-            any_of_task(ref_counted_resource_handle &&coroutine_handle) noexcept
-                : task_base<T>(std::move(coroutine_handle)) {
-                this->get_promise()->set_never_elided();
-            }
-        };
-
-        // Called from any_of's suspend_and_then: starts every child; the first to finish resumes us.
-        template<typename PromiseType>
-        void start_any_of_children(PromiseType *promise) {
-            auto children = std::apply([](auto &... child) {
-                return std::array<promise_base *, sizeof...(child)>{child.get_promise()...};
-            }, promise->state.children);
-            start_children(promise, children, [](std::size_t index, ref_counted_resource_weak_handle weak_parent) {
-                return any_of_continuation<PromiseType>(index, std::move(weak_parent));
-            });
-        }
-
-        // Called once any_of has been resumed: moves out the winner's result and releases every child
-        // (which cancels the cancelable losers; the others run to completion and are destroyed then).
+        // Moves out the winner's result and releases every child (cancelable losers stop at their next
+        // suspension point, the others run on).
         template<typename Result, typename State>
         Result take_any_of_result(State &state) {
             Result results{};
             for_each_index<std::tuple_size_v<Result>>([&](auto i) {
                 constexpr std::size_t index = decltype(i)::value;
-                if (index == state.winner) {
+                if (index == state.sync->winner) {
                     std::get<index>(results) = std::get<index>(state.children).get_promise()->get_result_move();
                 }
             });
@@ -1691,41 +2050,13 @@ namespace coroutine {
         using any_of_args_result = std::tuple<std::optional<result_or_exception<typename Tasks::value_type>>...>;
 
         // Waits for the first task to finish; exactly one element of the result is engaged. The other
-        // tasks are released: cancelable ones stop at their next suspension point, the others run to
-        // completion. Each is destroyed once it has stopped.
-        //
-        // Safe anywhere, including in loops. The children and the any_of frame are heap allocated
-        // (no HALO, see any_of_task). Use any_of_once to save those allocations where it is safe.
-        template<typename... Tasks> requires (sizeof...(Tasks) > 0)
-        any_of_task<any_of_args_result<Tasks...>, any_of_args_shared_state<typename Tasks::value_type...>>
-        any_of(Tasks... tasks) {
-            using state_type = any_of_args_shared_state<typename Tasks::value_type...>;
-            using promise_type = ex_promise<any_of_args_result<Tasks...>, state_type>;
-
-            auto *promise = static_cast<promise_type *>(co_await get_current_promise());
-            state_type *state = &promise->state;
-
-            const auto contexts = contexts_of(tasks...);
-            state->children = std::make_tuple(into_non_throw(std::move(tasks))...);
-            assign_contexts(state->children, contexts);
-
-            co_await suspend_and_then([promise](std::coroutine_handle<>) {
-                start_any_of_children(promise);
-            });
-
-            co_return take_any_of_result<any_of_args_result<Tasks...>>(*state);
-        }
-
-        // Same as any_of, but the children, their wrappers and the any_of frame itself are embedded in
-        // the caller's frame (HALO), saving 2 * N + 1 heap allocations.
-        //
-        // Only use it where the enclosing scope cannot end, or be entered again, while a loser may still
-        // be running: in practice at the outermost scope of a coroutine body, never inside a loop. An
-        // elided frame lives in a slot of the enclosing braces, and once that scope is left the slot may
-        // be reused by the next child even though the loser is still using it.
+        // tasks are released: cancelable ones stop at their next suspension point, non-cancelable ones
+        // run to completion. any_of returns only once all of them are gone (structured, see
+        // wait_children_destroyed), so everything here may be embedded in the caller's frame (HALO),
+        // loops included. To not wait for a slow, non-cancelable loser, pass it through detach().
         template<typename... Tasks> requires (sizeof...(Tasks) > 0)
         ex_task<any_of_args_result<Tasks...>, any_of_args_shared_state<typename Tasks::value_type...>>
-        any_of_once(COROUTINE_AWAIT_ELIDABLE_ARGUMENT Tasks... tasks) {
+        any_of(COROUTINE_AWAIT_ELIDABLE_ARGUMENT Tasks... tasks) {
             using state_type = any_of_args_shared_state<typename Tasks::value_type...>;
             using promise_type = ex_promise<any_of_args_result<Tasks...>, state_type>;
 
@@ -1736,18 +2067,22 @@ namespace coroutine {
             state->children = std::make_tuple(
                 co_await force_await_embed_in_current_frame(into_non_throw(std::move(tasks)))...);
             assign_contexts(state->children, contexts);
+            state->sync->alive.store(sizeof...(Tasks) + 1, std::memory_order_relaxed);
 
             co_await suspend_and_then([promise](std::coroutine_handle<>) {
-                start_any_of_children(promise);
+                auto children = promises_of(promise->state.children);
+                start_any_of_children(promise, children, promise->state.sync);
             });
 
-            co_return take_any_of_result<any_of_args_result<Tasks...>>(*state);
+            auto results = take_any_of_result<any_of_args_result<Tasks...>>(*state);
+            co_await wait_children_destroyed{state->sync.get(), promise};
+            co_return results;
         }
 
         // -----------------------------------------------------------------------------------------
         // all_of / any_of over a vector
         //
-        // No HALO here: the wrappers are created in a loop (see immediate_value_task), so each one
+        // No HALO for the wrappers: they are created in a loop (see immediate_value_task), so each one
         // gets its own heap frame.
         // -----------------------------------------------------------------------------------------
 
@@ -1767,16 +2102,13 @@ namespace coroutine {
 
         template<typename T>
         struct all_of_vector_shared_state {
-            std::atomic_size_t remaining{0};
+            std::shared_ptr<combinator_sync> sync = std::make_shared<combinator_sync>();
             std::vector<non_throw_task<T>> children;
 
-            // Called (through ex_promise) when the combinator is cancelled while its children run: release
-            // them, which cancels the cancelable ones. Without this the children, which hold our frame
-            // weakly, and the frame, which holds them strongly here, would keep each other alive forever.
-            // Safe: everything else that touches `children` either holds a strong reference to us or
-            // only does so after a successful lock().
+            // See all_of_args_shared_state.
             void release_resources() noexcept {
                 children = decltype(children){};
+                sync.reset();
             }
         };
 
@@ -1796,12 +2128,11 @@ namespace coroutine {
             if (state->children.empty()) {
                 co_return result_type{}; // nothing would ever resume us
             }
-            state->remaining.store(state->children.size(), std::memory_order_relaxed);
+
+            state->sync->alive.store(state->children.size() + 1, std::memory_order_relaxed);
 
             co_await suspend_and_then([promise](std::coroutine_handle<>) {
-                start_children(promise, promise->state.children, [](std::size_t, ref_counted_resource_weak_handle weak_parent) {
-                    return all_of_continuation<promise_type>(std::move(weak_parent));
-                });
+                start_all_of_children(promise, promise->state.children, promise->state.sync);
             });
 
             result_type results;
@@ -1810,30 +2141,27 @@ namespace coroutine {
                 results.push_back(child.get_promise()->get_result_move());
             }
             state->children.clear();
+            co_await wait_children_destroyed{state->sync.get(), promise};
             co_return results;
         }
 
         template<typename T>
         struct any_of_vector_shared_state {
-            std::atomic_bool finished{false};
-            std::size_t winner = 0;
+            std::shared_ptr<combinator_sync> sync = std::make_shared<combinator_sync>();
             std::vector<non_throw_task<T>> children;
 
-            // Called (through ex_promise) when the combinator is cancelled while its children run: release
-            // them, which cancels the cancelable ones. Without this the children, which hold our frame
-            // weakly, and the frame, which holds them strongly here, would keep each other alive forever.
-            // Safe: everything else that touches `children` either holds a strong reference to us or
-            // only does so after a successful lock().
+            // See any_of_args_shared_state.
             void release_resources() noexcept {
                 children = decltype(children){};
+                sync.reset();
             }
         };
 
-        // Vector version of any_of; like it, safe in loops (see any_of_task).
+        // Vector version of any_of; also structured (returns once every child is gone).
         template<typename Task>
-        any_of_task<std::vector<std::optional<result_or_exception<typename Task::value_type>>>,
+        ex_task<std::vector<std::optional<result_or_exception<typename Task::value_type>>>,
             any_of_vector_shared_state<typename Task::value_type>>
-        any_of(std::vector<Task> tasks) {
+        any_of(COROUTINE_AWAIT_ELIDABLE_ARGUMENT std::vector<Task> tasks) {
             using T = typename Task::value_type;
             using result_type = std::vector<std::optional<result_or_exception<T>>>;
             using state_type = any_of_vector_shared_state<T>;
@@ -1846,16 +2174,17 @@ namespace coroutine {
             if (state->children.empty()) {
                 co_return result_type{}; // nothing would ever resume us
             }
+            state->sync->alive.store(state->children.size() + 1, std::memory_order_relaxed);
 
             co_await suspend_and_then([promise](std::coroutine_handle<>) {
-                start_children(promise, promise->state.children, [](std::size_t index, ref_counted_resource_weak_handle weak_parent) {
-                    return any_of_continuation<promise_type>(index, std::move(weak_parent));
-                });
+                start_any_of_children(promise, promise->state.children, promise->state.sync);
             });
 
+            const std::size_t winner = state->sync->winner;
             result_type results(state->children.size());
-            results[state->winner] = state->children[state->winner].get_promise()->get_result_move();
-            state->children.clear(); // cancels the losers
+            results[winner] = state->children[winner].get_promise()->get_result_move();
+            state->children.clear(); // releases every child; the cancelable losers stop
+            co_await wait_children_destroyed{state->sync.get(), promise};
             co_return results;
         }
 
@@ -1963,11 +2292,9 @@ namespace coroutine {
 
                         auto weak_parent = m_parent_promise->weak_borrow();
                         promise->set_owner(weak_parent);
-                        promise->set_continuation([weak_parent = std::move(weak_parent)]() {
-                            if (auto parent = weak_parent.lock()) {
-                                auto *p = static_cast<promise_base *>(parent.get());
-                                p->get_execution_context()->resume_promise(p);
-                            }
+                        promise->set_continuation([weak_parent = std::move(weak_parent)]() mutable {
+                            // Each co_await of the generator installs a fresh continuation, so it is used once.
+                            schedule_resume(std::move(weak_parent));
                         });
 
                         promise->get_execution_context()->resume_promise(promise);
@@ -2005,16 +2332,18 @@ namespace coroutine {
         template<typename T>
         class COROUTINE_AWAIT_ELIDABLE io_task;
 
-        // Waits for a std::future on the I/O pool.
-        template<template<typename> typename TaskType = io_task, typename T>
+        // Waits for a std::future without blocking a thread (it is polled, see poll_until).
+        template<template<typename> typename TaskType = cancelable_task, typename T>
         TaskType<T> from_future(std::future<T> future) {
+            co_await poll_until([&future] {
+                return future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+            });
             co_return future.get();
         }
     }
 
     using _details::all_of;
     using _details::any_of;
-    using _details::any_of_once;
     using _details::generator;
     using _details::asyncify;
     using _details::from_future;
@@ -2022,6 +2351,9 @@ namespace coroutine {
     using _details::get_current_coroutine_context;
     using _details::get_current_promise_base;
     using _details::get_current_coroutine_info;
+    using _details::delay;
+    using _details::poll_until;
+    using _details::detach;
 
     template<typename T>
     using future = _details::task<T>;
@@ -2053,10 +2385,11 @@ namespace coroutine {
             }
 
             // Returns this task's result, or throws interrupted_exception if `interrupt_signal`
-            // finishes first. Both tasks become any_of children (the loser may outlive this call), so
-            // the parameters are deliberately not COROUTINE_AWAIT_ELIDABLE_ARGUMENT.
+            // finishes first. Like any_of, it returns only once both tasks are gone, so a non-cancelable
+            // task is not actually interrupted: make it cancelable, or detach() it.
             template<template<typename...> typename TaskType>
-            task<T> interrupt_by(this interruptable_task<T> self, TaskType<void> interrupt_signal) {
+            task<T> interrupt_by(COROUTINE_AWAIT_ELIDABLE_ARGUMENT this interruptable_task<T> self,
+                                 COROUTINE_AWAIT_ELIDABLE_ARGUMENT TaskType<void> interrupt_signal) {
                 auto *signal = interrupt_signal.get_promise();
                 auto [this_task, interrupt_task] = co_await any_of(std::move(self), std::move(interrupt_signal));
                 if (this_task) {
@@ -2075,7 +2408,8 @@ namespace coroutine {
             // Like interrupt_by, but returns std::nullopt when interrupted and never throws.
             template<typename TaskType>
             task<std::optional<result_or_exception<T>>> interrupt_by_nothrow(
-                this interruptable_task<T> self, TaskType interrupt_signal) {
+                COROUTINE_AWAIT_ELIDABLE_ARGUMENT this interruptable_task<T> self,
+                COROUTINE_AWAIT_ELIDABLE_ARGUMENT TaskType interrupt_signal) {
                 auto [this_task, interrupt_task] = co_await any_of(std::move(self), std::move(interrupt_signal));
                 co_return std::move(this_task);
             }
@@ -2094,14 +2428,14 @@ namespace coroutine {
             }
         };
 
-        inline io_task<void> wait_for_semaphore(std::shared_ptr<std::binary_semaphore> semaphore) {
-            semaphore->acquire();
-            co_return;
+        // Acquires the semaphore without blocking a thread (it is polled, see poll_until).
+        inline cancelable_task<void> wait_for_semaphore(std::shared_ptr<std::binary_semaphore> semaphore) {
+            co_await poll_until([&semaphore] { return semaphore->try_acquire(); });
         }
 
-        inline io_task<void> sleep_for(std::chrono::milliseconds duration) {
-            std::this_thread::sleep_for(duration);
-            co_return;
+        // Timer-based: no thread is blocked, and cancelling it (e.g. as an any_of loser) is immediate.
+        inline cancelable_task<void> sleep_for(std::chrono::steady_clock::duration duration) {
+            co_await delay(duration);
         }
     }
 
