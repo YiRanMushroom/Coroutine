@@ -7,10 +7,13 @@
 // Every iteration runs on a fresh multithreaded_execution_context (cycling through several thread
 // counts) and, once that context has been destroyed, checks that no promise is still alive.
 
+#define _CRT_SECURE_NO_WARNINGS // std::getenv
+
 #include "coroutine.hpp"
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <generator>
 #include <print>
@@ -211,6 +214,283 @@ namespace {
             coroutine::any_of(slow_counter(progress, 1000), slow_counter(progress, 1000))
             .into<coroutine::cancelable_task>());
         co_return fast1.has_value() && !slow1.has_value() && fast2.has_value() && !slow2.has_value();
+    }
+
+    // Benchmarks: almost no work per coroutine, so the time is dominated by scheduling.
+    task<bool> bench_sequential_awaits(int n) {
+        long long sum = 0;
+        for (int i = 0; i < n; ++i) {
+            sum += co_await value_of(i);
+        }
+        co_return sum == static_cast<long long>(n) * (n - 1) / 2;
+    }
+
+    task<bool> bench_deep_chain() {
+        co_return co_await chain(2000) == 2000;
+    }
+
+    std::generator<std::uint64_t> fibonacci(unsigned n);
+
+    // ---------------------------------------------------------------------------------------------
+    // Fuzz: a random tree of coroutines mixing every feature, checked against a synchronous model.
+    // Values only depend on the seed (any_of / interrupt nodes ignore which child won), so the result
+    // is deterministic even though scheduling is not.
+    // ---------------------------------------------------------------------------------------------
+
+    std::uint64_t mix(std::uint64_t x) {
+        x += 0x9E3779B97F4A7C15ull;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return x ^ (x >> 31);
+    }
+
+    enum fuzz_kind {
+        k_leaf, k_throw, k_sleep, k_await, k_all_tuple, k_all_vector, k_any_tuple, k_any_vector,
+        k_loop, k_any_once, k_interrupt, k_cancel_all, k_kind_count
+    };
+
+    fuzz_kind kind_of(std::uint64_t seed, int depth) {
+        if (depth == 0) {
+            return static_cast<fuzz_kind>(mix(seed) % 3); // leaf, throw or sleep
+        }
+        return static_cast<fuzz_kind>(mix(seed) % k_kind_count);
+    }
+
+    long long leaf_value(std::uint64_t seed) {
+        return static_cast<long long>(mix(seed ^ 0x1234) % 1000);
+    }
+
+    std::uint64_t child_seed(std::uint64_t seed, int i) {
+        return mix(seed * 31 + static_cast<std::uint64_t>(i) + 1);
+    }
+
+    int child_count(std::uint64_t seed) {
+        return 1 + static_cast<int>(mix(seed ^ 0x55) % 4);
+    }
+
+    long long value_or(const std::optional<long long> &v, long long fallback) {
+        return v ? *v : fallback;
+    }
+
+    long long value_or(const std::expected<long long, std::exception_ptr> &v, long long fallback) {
+        return v ? *v : fallback;
+    }
+
+    // The synchronous model. std::nullopt means "throws".
+    std::optional<long long> fuzz_model(std::uint64_t seed, int depth) {
+        switch (kind_of(seed, depth)) {
+            case k_leaf: return leaf_value(seed);
+            case k_throw: return std::nullopt;
+            case k_sleep: return leaf_value(seed);
+            case k_await: return value_or(fuzz_model(child_seed(seed, 0), depth - 1), 6) + 1;
+            case k_all_tuple:
+                return value_or(fuzz_model(child_seed(seed, 0), depth - 1), 13) +
+                       value_or(fuzz_model(child_seed(seed, 1), depth - 1), 13);
+            case k_all_vector: {
+                long long sum = 0;
+                for (int i = 0; i < child_count(seed); ++i) {
+                    sum += value_or(fuzz_model(child_seed(seed, i), depth - 1), 13);
+                }
+                return sum;
+            }
+            case k_any_tuple: return 100 + leaf_value(seed);
+            case k_any_vector: return 200 + leaf_value(seed);
+            case k_loop: {
+                long long sum = 0;
+                for (int i = 0; i < 3; ++i) {
+                    sum += value_or(fuzz_model(child_seed(seed, i), depth - 1), 7);
+                }
+                return sum;
+            }
+            case k_any_once: return 300 + leaf_value(seed);
+            case k_interrupt: return 400 + leaf_value(seed);
+            case k_cancel_all: return 500 + leaf_value(seed);
+            default: return 0;
+        }
+    }
+
+    template<template<typename> class TaskT>
+    TaskT<long long> fuzz_node(std::uint64_t seed, int depth);
+
+    // A child of either task type, chosen by the seed.
+    task<long long> fuzz_child(std::uint64_t seed, int depth) {
+        if (mix(seed ^ 0xC0FFEE) & 1) {
+            co_return co_await fuzz_node<cancelable_task>(seed, depth);
+        }
+        co_return co_await fuzz_node<task>(seed, depth);
+    }
+
+    // any_of_once used as documented: at the outermost scope of the coroutine body.
+    task<long long> fuzz_any_once(std::uint64_t seed, int depth) {
+        co_await coroutine::any_of_once(fuzz_node<task>(child_seed(seed, 0), depth - 1),
+                                        fuzz_node<cancelable_task>(child_seed(seed, 1), depth - 1));
+        co_return 300 + leaf_value(seed);
+    }
+
+    template<template<typename> class TaskT>
+    TaskT<long long> fuzz_node(std::uint64_t seed, int depth) {
+        switch (kind_of(seed, depth)) {
+            case k_leaf:
+                co_return leaf_value(seed);
+            case k_throw:
+                throw std::runtime_error("fuzz");
+            case k_sleep:
+                co_await coroutine::sleep_for(std::chrono::milliseconds(mix(seed) % 2));
+                co_return leaf_value(seed);
+            case k_await: {
+                long long v = 6;
+                try {
+                    v = co_await fuzz_child(child_seed(seed, 0), depth - 1);
+                } catch (const std::runtime_error &) {
+                }
+                co_return v + 1;
+            }
+            case k_all_tuple: {
+                auto [a, b] = co_await coroutine::all_of(fuzz_node<task>(child_seed(seed, 0), depth - 1),
+                                                         fuzz_node<cancelable_task>(child_seed(seed, 1), depth - 1));
+                co_return value_or(a, 13) + value_or(b, 13);
+            }
+            case k_all_vector: {
+                std::vector<task<long long>> children;
+                for (int i = 0; i < child_count(seed); ++i) {
+                    children.push_back(fuzz_child(child_seed(seed, i), depth - 1));
+                }
+                long long sum = 0;
+                for (auto &r: co_await coroutine::all_of(std::move(children))) {
+                    sum += value_or(r, 13);
+                }
+                co_return sum;
+            }
+            case k_any_tuple:
+                co_await coroutine::any_of(fuzz_node<cancelable_task>(child_seed(seed, 0), depth - 1),
+                                           fuzz_node<task>(child_seed(seed, 1), depth - 1));
+                co_return 100 + leaf_value(seed);
+            case k_any_vector: {
+                std::vector<cancelable_task<long long>> children;
+                for (int i = 0; i < child_count(seed); ++i) {
+                    children.push_back(fuzz_node<cancelable_task>(child_seed(seed, i), depth - 1));
+                }
+                co_await coroutine::any_of(std::move(children));
+                co_return 200 + leaf_value(seed);
+            }
+            case k_loop: {
+                long long sum = 0;
+                for (int i = 0; i < 3; ++i) {
+                    try {
+                        sum += co_await fuzz_child(child_seed(seed, i), depth - 1);
+                    } catch (const std::runtime_error &) {
+                        sum += 7;
+                    }
+                }
+                co_return sum;
+            }
+            case k_any_once:
+                co_return co_await fuzz_any_once(seed, depth);
+            case k_interrupt:
+                try {
+                    co_await fuzz_node<task>(child_seed(seed, 0), depth - 1)
+                            .template into<coroutine::interruptable_task>()
+                            .interrupt_by(coroutine::sleep_for(std::chrono::milliseconds(mix(seed) % 2)));
+                } catch (...) {
+                }
+                co_return 400 + leaf_value(seed);
+            case k_cancel_all:
+                // The all_of usually loses and is cancelled while its children still run.
+                co_await coroutine::any_of(
+                    fuzz_node<task>(child_seed(seed, 0), 0),
+                    coroutine::all_of(fuzz_node<cancelable_task>(child_seed(seed, 1), depth - 1),
+                                      fuzz_node<cancelable_task>(child_seed(seed, 2), depth - 1))
+                    .template into<cancelable_task>());
+                co_return 500 + leaf_value(seed);
+            default:
+                co_return 0;
+        }
+    }
+
+    task<bool> test_fuzz(std::uint64_t seed, int depth) {
+        const auto expected = fuzz_model(seed, depth);
+        try {
+            const long long got = co_await fuzz_node<task>(seed, depth);
+            co_return expected && got == *expected;
+        } catch (const std::runtime_error &) {
+            co_return !expected;
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Targeted stress tests
+    // ---------------------------------------------------------------------------------------------
+
+    // A deep chain of cancelable tasks, cancelled while its bottom is still waiting.
+    cancelable_task<int> cancelable_chain(int depth) {
+        if (depth == 0) {
+            co_await coroutine::sleep_for(50ms);
+            co_return 0;
+        }
+        co_return 1 + co_await cancelable_chain(depth - 1);
+    }
+
+    task<bool> test_deep_cancel(int depth) {
+        auto [fast, deep] = co_await coroutine::any_of(delayed_value(10ms, 1), cancelable_chain(depth));
+        co_return fast.has_value() && !deep.has_value();
+    }
+
+    task<bool> test_generator_abandon() {
+        {
+            auto gen = coroutine::asyncify(fibonacci(50));
+            for (int i = 0; i < 3; ++i) {
+                if (!co_await gen) {
+                    co_return false;
+                }
+            }
+        } // dropped while suspended at a co_yield
+        auto a = coroutine::asyncify(fibonacci(40));
+        auto b = coroutine::asyncify(fibonacci(40));
+        std::uint64_t last = 0;
+        for (int i = 0; i < 40; ++i) {
+            auto va = co_await a;
+            auto vb = co_await b;
+            if (!va || !vb || *va != *vb) {
+                co_return false;
+            }
+            last = *va;
+        }
+        const bool a_done = !(co_await a);
+        const bool b_done = !(co_await b);
+        co_return a_done && b_done && last == 63245986;
+    }
+
+    // The root finishes while a pinned loser (sleep_for 30 ms) is still running; the context's
+    // destructor must wait for it.
+    task<void> root_with_pinned_loser(std::atomic<int> *done) {
+        co_await coroutine::any_of(coroutine::sleep_for(0ms), coroutine::sleep_for(30ms));
+        done->fetch_add(1);
+    }
+
+    // Spawns more roots from inside a coroutine while the owner may already be destroying the context.
+    task<void> spawn_more(std::atomic<int> *done, int depth) {
+        if (depth > 0) {
+            auto *ctx = co_await coroutine::get_current_coroutine_context();
+            ctx->co_spawn(spawn_more(done, depth - 1));
+            ctx->co_spawn(spawn_more(done, depth - 1));
+        }
+        co_await coroutine::sleep_for(0ms);
+        done->fetch_add(1);
+    }
+
+    task<bool> test_interrupt_in_loop() {
+        int completed = 0, interrupted = 0;
+        for (int i = 0; i < 30; ++i) {
+            try {
+                co_await coroutine::sleep_for(std::chrono::milliseconds(i % 2))
+                        .into<coroutine::interruptable_task>()
+                        .interrupt_by(coroutine::sleep_for(std::chrono::milliseconds((i + 1) % 2)));
+                ++completed;
+            } catch (const coroutine::interrupted_exception &) {
+                ++interrupted;
+            }
+        }
+        co_return completed + interrupted == 30;
     }
 
     task<bool> test_exceptions() {
@@ -449,6 +729,56 @@ int main(int argc, char **argv) {
         }
         CHECK(sum.load() == 300 * 3);
     });
+    run("fuzz", 300, [](auto &ctx) {
+        // FUZZ_SEED picks a different batch of trees; schedules differ from run to run anyway.
+        static std::uint64_t next_seed = [] {
+            const char *env = std::getenv("FUZZ_SEED");
+            return env ? std::strtoull(env, nullptr, 10) * 100000 + 1 : 1;
+        }();
+        for (int i = 0; i < 4; ++i) {
+            const std::uint64_t seed = next_seed++;
+            if (!ctx.block_on(test_fuzz(seed, 5))) {
+                std::println(stderr, "    fuzz seed {} gave a wrong result", seed);
+                ++g_failures;
+            }
+        }
+        ctx.wait_idle(); // pinned losers may still be running
+    });
+    run("deep_cancel", 5, [](auto &ctx) { CHECK(ctx.block_on(test_deep_cancel(20000))); });
+    run("concurrent_block_on", 10, [](auto &ctx) {
+        std::atomic<int> ok{0};
+        {
+            std::vector<std::jthread> threads;
+            for (int t = 0; t < 8; ++t) {
+                threads.emplace_back([&] {
+                    for (int i = 0; i < 50; ++i) {
+                        ok += ctx.block_on(test_all_of_tuple()) ? 1 : 0;
+                    }
+                });
+            }
+        }
+        CHECK(ok.load() == 8 * 50);
+    });
+    run("generator_abandon", 100, [](auto &ctx) { CHECK(ctx.block_on(test_generator_abandon())); });
+    run("destroy_with_pinned_loser", 20, [](auto &) {
+        std::atomic<int> done{0};
+        {
+            coroutine::multithreaded_execution_context local{2, 2};
+            local.co_spawn(root_with_pinned_loser(&done));
+        }
+        CHECK(done.load() == 1);
+    });
+    run("nested_co_spawn", 20, [](auto &) {
+        std::atomic<int> done{0};
+        {
+            coroutine::multithreaded_execution_context local{4, 4};
+            local.co_spawn(spawn_more(&done, 6));
+        }
+        CHECK(done.load() == 127); // 2^7 - 1 coroutines
+    });
+    run("interrupt_in_loop", 10, [](auto &ctx) { CHECK(ctx.block_on(test_interrupt_in_loop())); });
+    run("bench_sequential_awaits", 20, [](auto &ctx) { CHECK(ctx.block_on(bench_sequential_awaits(20000))); });
+    run("bench_deep_chain", 20, [](auto &ctx) { CHECK(ctx.block_on(bench_deep_chain())); });
     run("cancel_task(original)", 50, [](auto &ctx) {
         std::atomic<int> done{0};
         {

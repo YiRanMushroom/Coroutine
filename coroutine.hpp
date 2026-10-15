@@ -54,7 +54,8 @@
 #include <memory>
 #include <optional>
 #include <semaphore>
-#include <shared_mutex>
+#include <condition_variable>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -119,8 +120,7 @@ namespace coroutine {
                 assert(old > 0 && "releasing a strong reference that is not held");
                 if (old == 1) {
                     std::atomic_thread_fence(std::memory_order_acquire);
-                    release_resources();
-                    release_weak_reference(); // the weak reference held by the strong references
+                    run_or_defer(pending_kind::release);
                 }
             }
 
@@ -129,7 +129,7 @@ namespace coroutine {
                 assert(old > 0 && "releasing a weak reference that is not held");
                 if (old == 1) {
                     std::atomic_thread_fence(std::memory_order_acquire);
-                    destroy();
+                    run_or_defer(pending_kind::destroy);
                 }
             }
 
@@ -154,7 +154,75 @@ namespace coroutine {
             // Called once when the last weak reference is released; must destroy the object.
             virtual void destroy() noexcept = 0;
 
+        protected:
+            // Set (by promise_base) once this object holds a reference to its owner; see run_or_defer.
+            void mark_has_owner() noexcept {
+                m_has_owner = true;
+            }
+
         private:
+            // Releasing one coroutine releases its children, destroying a frame releases its owner, and
+            // so on. Done recursively, cancelling a chain of 20000 coroutines overflows the stack. So the
+            // outermost release on a thread drains a thread-local list in a loop, and releases triggered
+            // while it does so are queued instead of run. The outermost call still returns only once
+            // everything has been released, so callers (e.g. await_resume dropping a child) see the same
+            // ordering as before.
+            //
+            // Only objects that hold their owner may be queued. With HALO an object's memory can be a slot
+            // in another frame; the owner reference is what keeps that frame alive until the object is
+            // gone. An object without one (a child that was created but never started, or a heap-allocated
+            // root) must be handled right away: it may be released by the destruction of the very frame
+            // that contains it, and that frame's memory is freed as soon as its destruction returns. Such
+            // objects never form long chains (their own children hold them as owner), so the recursion
+            // stays shallow.
+            enum class pending_kind : uint8_t {
+                release, // last strong reference gone: release_resources(), then the group's weak reference
+                destroy, // last weak reference gone: destroy()
+            };
+
+            struct release_queue {
+                pin_resource_base *head;
+                bool draining;
+            };
+
+            inline static thread_local release_queue t_release_queue{nullptr, false};
+
+            static void process(pin_resource_base *resource, pending_kind kind) noexcept {
+                if (kind == pending_kind::release) {
+                    resource->release_resources();
+                    resource->release_weak_reference(); // the weak reference held by the strong references
+                } else {
+                    resource->destroy(); // `resource` is gone after this
+                }
+            }
+
+            void run_or_defer(pending_kind kind) noexcept {
+                auto &queue = t_release_queue;
+                if (queue.draining && m_has_owner) {
+                    // An object is queued at most once at a time: its weak count cannot reach zero while
+                    // its `release` entry is pending, because that entry still owns the group's weak
+                    // reference.
+                    m_pending_kind = kind;
+                    m_next_pending = std::exchange(queue.head, this);
+                    return;
+                }
+
+                const bool outermost = !queue.draining;
+                queue.draining = true;
+                process(this, kind);
+                if (outermost) {
+                    while (pin_resource_base *resource = queue.head) {
+                        queue.head = resource->m_next_pending;
+                        process(resource, resource->m_pending_kind);
+                    }
+                    queue.draining = false;
+                }
+            }
+
+            pin_resource_base *m_next_pending = nullptr;
+            pending_kind m_pending_kind = pending_kind::release;
+            bool m_has_owner = false;
+
             std::atomic_uint32_t m_strong_count{1};
             std::atomic_uint32_t m_weak_count{1};
         };
@@ -382,6 +450,9 @@ namespace coroutine {
             // Sets the coroutine that may contain our frame (see "Ownership model").
             void set_owner(ref_counted_resource_weak_handle owner_handle) noexcept {
                 m_owner_handle = std::move(owner_handle);
+                if (!m_owner_handle.is_null()) {
+                    mark_has_owner();
+                }
             }
 
             // ---- properties ----
@@ -408,6 +479,26 @@ namespace coroutine {
 
             void set_cancelable(bool value) noexcept {
                 m_cancelable = value;
+            }
+
+            // Set for coroutines whose frame is known to be on the heap (any_of_task). They do not hold
+            // their owner (see set_owner_if_needed).
+            [[nodiscard]] bool is_never_elided() const noexcept {
+                return m_never_elided;
+            }
+
+            void set_never_elided() noexcept {
+                m_never_elided = true;
+            }
+
+            // The owner reference exists only so that an owner whose frame may contain ours outlives us.
+            // A frame that is never elided is not inside its owner, and must not hold it: it may live on
+            // (any_of losers keep the any_of frame alive) long after the owner has finished, and the owner
+            // may itself be elided into a slot that its parent reuses right after the owner finishes.
+            void set_owner_if_needed(const ref_counted_resource_weak_handle &owner_handle) noexcept {
+                if (!m_never_elided) {
+                    set_owner(owner_handle);
+                }
             }
 
             [[nodiscard]] std::coroutine_handle<> get_coroutine_handle() const noexcept {
@@ -558,6 +649,7 @@ namespace coroutine {
             std::coroutine_handle<> m_coroutine_handle = nullptr;
             task_hint m_task_hint{e_none};
             bool m_cancelable = false;
+            bool m_never_elided = false;
         };
     }
 
@@ -861,7 +953,7 @@ namespace coroutine {
                         }
 
                         auto weak_parent = m_parent_promise->weak_borrow();
-                        child->set_owner(weak_parent);
+                        child->set_owner_if_needed(weak_parent);
                         child->set_continuation([weak_parent = std::move(weak_parent)]() {
                             if (auto parent = weak_parent.lock()) {
                                 auto *p = static_cast<promise_base *>(parent.get());
@@ -1046,8 +1138,10 @@ namespace coroutine {
             explicit multithreaded_execution_context(
                 uint32_t thread_count = std::jthread::hardware_concurrency(),
                 uint32_t io_thread_count = std::max(4u, 2 * std::jthread::hardware_concurrency()))
-                : m_thread_pool(std::make_unique<dp_thread_pool::thread_pool<>>(thread_count)),
-                  m_io_thread_pool(std::make_unique<dp_thread_pool::thread_pool<>>(io_thread_count)) {
+                : m_thread_pool(std::make_unique<dp_thread_pool::thread_pool<>>(
+                      thread_count, [this](std::size_t) { t_worker = {this, false}; })),
+                  m_io_thread_pool(std::make_unique<dp_thread_pool::thread_pool<>>(
+                      io_thread_count, [this](std::size_t) { t_worker = {this, true}; })) {
             }
 
             // Waits for every spawned coroutine, then for everything they left behind (e.g. pinned
@@ -1055,25 +1149,39 @@ namespace coroutine {
             // pools destroyed, so no job can enqueue into a pool that is already gone.
             ~multithreaded_execution_context() override {
                 {
-                    std::unique_lock lock(m_lock);
+                    std::unique_lock lock(m_holders_mutex);
+                    m_holders_changed.wait(lock, [this] { return m_holders == 0; });
                 }
                 wait_idle();
             }
 
             void resume_promise_weak(ref_counted_resource_weak_handle handle) override {
                 const auto hint = static_cast<promise_base *>(handle.get_raw())->get_task_hint();
+
+                // Fast path: called on one of our workers that runs coroutines with the same hint, and
+                // nothing is queued for this thread yet. Instead of going through the pool, let the run
+                // loop below resume the coroutine right after the current one has suspended or finished.
+                if (t_worker.context == this && t_worker.io == static_cast<bool>(hint & promise_base::e_io) &&
+                    t_next.is_null()) {
+                    t_next = std::move(handle);
+                    return;
+                }
+
                 enqueue(hint, [handle = std::move(handle)]() mutable {
-                    // The coroutine may have been cancelled since it was scheduled.
-                    if (auto strong = std::exchange(handle, {}).lock()) {
-                        promise_base::resume_and_finish(std::move(strong));
-                    }
+                    // The coroutine may have been cancelled since it was scheduled. Keep this a separate
+                    // statement: the weak reference must be gone before the coroutine runs. If it lived on
+                    // until run_on_this_thread returned, it would keep a finished child's frame alive after
+                    // its parent was resumed, and the parent could build its next child in the same HALO
+                    // slot while we still hold a reference into it.
+                    auto strong = std::exchange(handle, {}).lock();
+                    run_on_this_thread(std::move(strong));
                 });
             }
 
             void resume_promise_strong(ref_counted_resource_handle handle) override {
                 const auto hint = static_cast<promise_base *>(handle.get())->get_task_hint();
                 enqueue(hint, [handle = std::move(handle)]() mutable {
-                    promise_base::resume_and_finish(std::move(handle));
+                    run_on_this_thread(std::move(handle));
                 });
             }
 
@@ -1084,12 +1192,21 @@ namespace coroutine {
                 }
             }
 
+            // A count rather than a std::shared_mutex: with a reader/writer lock, a coroutine that calls
+            // co_spawn (lock()) while the destructor is waiting for the exclusive lock can be blocked
+            // behind it, and the destructor waits for that very coroutine: deadlock. lock() never blocks.
             void lock() override {
-                m_lock.lock_shared();
+                std::lock_guard guard(m_holders_mutex);
+                ++m_holders;
             }
 
             void unlock() override {
-                m_lock.unlock_shared();
+                // Notify while holding the mutex: the destructor cannot return from its wait (and destroy
+                // the mutex and condition variable) before we have released it.
+                std::lock_guard guard(m_holders_mutex);
+                if (--m_holders == 0) {
+                    m_holders_changed.notify_all();
+                }
             }
 
             void co_spawn(task_base<void> coroutine) override {
@@ -1106,6 +1223,29 @@ namespace coroutine {
             }
 
         private:
+            // Which context and pool the current thread works for (set by the pools' init function).
+            struct worker_identity {
+                multithreaded_execution_context *context;
+                bool io;
+            };
+
+            inline static thread_local worker_identity t_worker{nullptr, false};
+
+            // The coroutine to resume next on this thread (see resume_promise_weak). Weak, like a queued
+            // job: if it is cancelled before we get to it, lock() fails and it does not run.
+            inline static thread_local ref_counted_resource_weak_handle t_next{};
+
+            // Resumes `strong`, then whatever it scheduled into t_next, and so on. A loop rather than
+            // nested resume() calls, so the stack depth stays constant however long the chain is. Each
+            // coroutine is resumed only after resume_and_finish has returned for the previous one, i.e.
+            // after the previous one released its references (see final_awaiter).
+            static void run_on_this_thread(ref_counted_resource_handle strong) {
+                while (strong) {
+                    promise_base::resume_and_finish(std::move(strong));
+                    strong = std::exchange(t_next, {}).lock();
+                }
+            }
+
             template<typename Job>
             void enqueue(promise_base::task_hint hint, Job job) {
                 m_pending_jobs.fetch_add(1, std::memory_order_relaxed);
@@ -1131,7 +1271,9 @@ namespace coroutine {
             std::atomic_size_t m_pending_jobs{0};
             std::unique_ptr<dp_thread_pool::thread_pool<>> m_thread_pool;
             std::unique_ptr<dp_thread_pool::thread_pool<>> m_io_thread_pool;
-            std::shared_mutex m_lock;
+            std::mutex m_holders_mutex;
+            std::condition_variable m_holders_changed;
+            std::size_t m_holders = 0; // co_spawn'ed roots that have not finished, plus explicit lock()s
         };
     }
 
@@ -1369,7 +1511,7 @@ namespace coroutine {
                 if (!child->get_execution_context()) {
                     child->set_execution_context(context);
                 }
-                child->set_owner(weak_parent);
+                child->set_owner_if_needed(weak_parent);
                 child->set_continuation(make_continuation(index, weak_parent));
                 started[index] = child->weak_borrow();
                 ++index;
@@ -1515,6 +1657,7 @@ namespace coroutine {
 
             any_of_task(ref_counted_resource_handle &&coroutine_handle) noexcept
                 : task_base<T>(std::move(coroutine_handle)) {
+                this->get_promise()->set_never_elided();
             }
         };
 
